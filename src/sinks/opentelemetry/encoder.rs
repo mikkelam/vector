@@ -9,8 +9,15 @@ use bytes::Bytes;
 use prost::Message;
 use vector_lib::opentelemetry::proto::{
     collector::logs::v1::ExportLogsServiceRequest,
+    collector::metrics::v1::ExportMetricsServiceRequest,
     common::v1::{any_value::Value as PbValue, AnyValue, KeyValue, KeyValueList},
     logs::v1::{LogRecord, ResourceLogs, ScopeLogs, SeverityNumber},
+    metrics::v1::{
+        metric::Data, number_data_point::Value as NumberDataPointValue,
+        summary_data_point::ValueAtQuantile, AggregationTemporality, Gauge, Histogram,
+        HistogramDataPoint, Metric as OtlpMetric, NumberDataPoint, ResourceMetrics, ScopeMetrics,
+        Sum, Summary, SummaryDataPoint,
+    },
     resource::v1::Resource,
 };
 use vrl::{
@@ -19,7 +26,7 @@ use vrl::{
 };
 
 use crate::{
-    event::{Event, LogEvent},
+    event::{Event, LogEvent, Metric as VectorMetric, MetricKind, MetricValue},
     sinks::prelude::*,
 };
 
@@ -62,7 +69,11 @@ impl OtlpEncoder {
         }
 
         let scope_logs = vec![ScopeLogs {
-            scope: None, // TODO: Add scope support
+            // Vector acts as a transparent aggregator/router, not the original instrumentation library.
+            // Setting scope to None preserves the original instrumentation context from upstream sources.
+            // Per OTLP spec, scope identifies "the logical unit of software that emits the telemetry" -
+            // that's the original application, not Vector as the intermediary.
+            scope: None,
             log_records,
             schema_url: String::new(),
         }];
@@ -136,13 +147,43 @@ impl OtlpEncoder {
         }
     }
 
-    #[allow(dead_code, unused_variables)]
-    fn encode_metrics(&self, events: Vec<Event>) -> Result<Bytes, ()> {
-        // TODO: Implement metric encoding
-        emit!(SinkRequestBuildError {
-            error: "Metric encoding is not yet implemented for the OTLP sink."
-        });
-        Err(())
+    pub(super) fn encode_metrics(&self, events: Vec<Event>) -> Result<Bytes, ()> {
+        let mut metric_records = Vec::new();
+
+        // Vector metrics typically don't have resource-level attributes in the same way as logs.
+        // Most Vector metric sources (internal_metrics, prometheus, etc.) don't provide
+        // resource-level context, and adding Vector's own service info would be misleading
+        // for metrics that originated from other services. Empty resource is valid per OTLP spec.
+        let resource_attributes = Vec::new();
+
+        for event in events {
+            let metric = event.into_metric();
+            let otlp_metric = convert_vector_metric_to_otlp(metric);
+            metric_records.push(otlp_metric);
+        }
+
+        let scope_metrics = vec![ScopeMetrics {
+            // Vector acts as a transparent aggregator/router, not the original instrumentation library.
+            // Setting scope to None preserves the original instrumentation context from upstream sources.
+            // Per OTLP spec, scope identifies "the logical unit of software that emits the telemetry" -
+            // that's the original application, not Vector as the intermediary.
+            scope: None,
+            metrics: metric_records,
+            schema_url: String::new(),
+        }];
+
+        let resource_metrics = vec![ResourceMetrics {
+            resource: Some(Resource {
+                attributes: resource_attributes,
+                dropped_attributes_count: 0,
+            }),
+            scope_metrics,
+            schema_url: String::new(),
+        }];
+
+        let request = ExportMetricsServiceRequest { resource_metrics };
+
+        Ok(request.encode_to_vec().into())
     }
 
     #[allow(dead_code, unused_variables)]
@@ -232,22 +273,6 @@ fn convert_object_map_to_key_value_vec(map: ObjectMap) -> Vec<KeyValue> {
             value: Some(convert_value_to_any_value(value)),
         })
         .collect()
-}
-
-fn try_convert_value_to_key_value_vec(value: Value) -> Result<Vec<KeyValue>, ()> {
-    if let Value::Object(map) = value {
-        Ok(convert_object_map_to_key_value_vec(map))
-    } else {
-        // OTLP resources and attributes must be objects.
-        // Emit an event and return an error.
-        emit!(SinkRequestBuildError {
-            error: format!(
-                "Expected object for resource/attributes, got: {}",
-                value.kind()
-            )
-        });
-        Err(())
-    }
 }
 
 /// Extract severity number and text from a log event.
@@ -345,5 +370,178 @@ fn map_numeric_severity(level: i64) -> (i32, String) {
             SeverityNumber::Unspecified as i32,
             format!("LEVEL_{}", level),
         ),
+    }
+}
+
+/// Converts a Vector Metric into an OTLP Metric.
+fn convert_vector_metric_to_otlp(metric: VectorMetric) -> OtlpMetric {
+    let name = metric.name().to_string();
+    let description = String::new(); // Vector metrics don't have descriptions
+    let unit = String::new(); // Vector metrics don't have units
+
+    // Convert metric tags to OTLP attributes
+    let attributes = if let Some(tags) = metric.tags() {
+        tags.iter_all()
+            .map(|(key, value)| KeyValue {
+                key: key.to_string(),
+                value: Some(AnyValue {
+                    value: Some(PbValue::StringValue(value.unwrap_or("").to_string())),
+                }),
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+
+    // Convert timestamp to nanoseconds
+    let time_unix_nano = metric
+        .timestamp()
+        .and_then(|ts| ts.timestamp_nanos_opt())
+        .unwrap_or(0) as u64;
+
+    let data = match metric.value() {
+        MetricValue::Counter { value } => {
+            let data_point = NumberDataPoint {
+                attributes,
+                time_unix_nano,
+                start_time_unix_nano: 0, // TODO: Handle start time for cumulative metrics
+                value: Some(NumberDataPointValue::AsDouble(*value)),
+                exemplars: Vec::new(),
+                flags: 0,
+            };
+
+            Some(Data::Sum(Sum {
+                data_points: vec![data_point],
+                aggregation_temporality: match metric.kind() {
+                    MetricKind::Incremental => AggregationTemporality::Delta as i32,
+                    MetricKind::Absolute => AggregationTemporality::Cumulative as i32,
+                },
+                is_monotonic: true, // Counters are always monotonic
+            }))
+        }
+        MetricValue::Gauge { value } => {
+            let data_point = NumberDataPoint {
+                attributes,
+                time_unix_nano,
+                start_time_unix_nano: 0,
+                value: Some(NumberDataPointValue::AsDouble(*value)),
+                exemplars: Vec::new(),
+                flags: 0,
+            };
+
+            Some(Data::Gauge(Gauge {
+                data_points: vec![data_point],
+            }))
+        }
+        MetricValue::AggregatedHistogram {
+            buckets,
+            count,
+            sum,
+        } => {
+            // Convert Vector buckets to OTLP format
+            let mut explicit_bounds = Vec::new();
+            let mut bucket_counts = Vec::new();
+
+            for bucket in buckets {
+                if bucket.upper_limit != f64::INFINITY {
+                    explicit_bounds.push(bucket.upper_limit);
+                }
+                bucket_counts.push(bucket.count);
+            }
+
+            let data_point = HistogramDataPoint {
+                attributes,
+                time_unix_nano,
+                start_time_unix_nano: 0,
+                count: *count,
+                sum: Some(*sum),
+                bucket_counts,
+                explicit_bounds,
+                exemplars: Vec::new(),
+                flags: 0,
+                min: None, // TODO: Track min/max if available
+                max: None,
+            };
+
+            Some(Data::Histogram(Histogram {
+                data_points: vec![data_point],
+                aggregation_temporality: match metric.kind() {
+                    MetricKind::Incremental => AggregationTemporality::Delta as i32,
+                    MetricKind::Absolute => AggregationTemporality::Cumulative as i32,
+                },
+            }))
+        }
+        MetricValue::AggregatedSummary {
+            quantiles,
+            count,
+            sum,
+        } => {
+            // Convert Vector quantiles to OTLP format
+            let quantile_values = quantiles
+                .iter()
+                .map(|q| ValueAtQuantile {
+                    quantile: q.quantile,
+                    value: q.value,
+                })
+                .collect();
+
+            let data_point = SummaryDataPoint {
+                attributes,
+                time_unix_nano,
+                start_time_unix_nano: 0,
+                count: *count,
+                sum: *sum,
+                quantile_values,
+                flags: 0,
+            };
+
+            Some(Data::Summary(Summary {
+                data_points: vec![data_point],
+            }))
+        }
+        MetricValue::Set { .. } => {
+            // OTLP doesn't have a direct equivalent for sets
+            // We could represent this as a gauge with the set size
+            emit!(SinkRequestBuildError {
+                error: "Set metrics are not directly supported in OTLP format"
+            });
+            return OtlpMetric {
+                name,
+                description,
+                unit,
+                data: None,
+            };
+        }
+        MetricValue::Distribution { .. } => {
+            // TODO: Convert distributions to histograms or summaries
+            emit!(SinkRequestBuildError {
+                error: "Distribution metrics conversion is not yet implemented"
+            });
+            return OtlpMetric {
+                name,
+                description,
+                unit,
+                data: None,
+            };
+        }
+        MetricValue::Sketch { .. } => {
+            // TODO: Convert sketches to histograms
+            emit!(SinkRequestBuildError {
+                error: "Sketch metrics conversion is not yet implemented"
+            });
+            return OtlpMetric {
+                name,
+                description,
+                unit,
+                data: None,
+            };
+        }
+    };
+
+    OtlpMetric {
+        name,
+        description,
+        unit,
+        data,
     }
 }

@@ -15,6 +15,7 @@ use crate::{
     sinks::{
         opentelemetry::{config::OpenTelemetryConfig, encoder::OtlpEncoder, sink::KeyPartitioner},
         prelude::*,
+        util::encoding::Encoder,
     },
     test_util::{
         components::{run_and_assert_sink_compliance, SINK_TAGS},
@@ -558,4 +559,264 @@ fn test_encoder_string_attributes() {
         }
         other => panic!("Expected IntValue for numeric_value, got: {:?}", other),
     }
+}
+
+#[test]
+fn test_encode_metrics_counter() {
+    use crate::event::{Metric, MetricKind, MetricValue};
+    use vector_lib::opentelemetry::proto::collector::metrics::v1::ExportMetricsServiceRequest;
+
+    let encoder = OtlpEncoder::new();
+
+    let metric = Metric::new(
+        "test_counter",
+        MetricKind::Incremental,
+        MetricValue::Counter { value: 42.0 },
+    )
+    .with_tags(Some({
+        let mut tags = crate::event::MetricTags::default();
+        tags.replace("host".to_string(), "example.com");
+        tags.replace("environment".to_string(), "test");
+        tags
+    }));
+
+    let events = vec![Event::Metric(metric)];
+    let result = encoder.encode_metrics(events).unwrap();
+
+    // Should have non-empty protobuf bytes
+    assert!(!result.is_empty());
+
+    // Decode and verify the structure
+    let request = ExportMetricsServiceRequest::decode(result.as_ref()).unwrap();
+    assert_eq!(request.resource_metrics.len(), 1);
+
+    let resource_metrics = &request.resource_metrics[0];
+    assert_eq!(resource_metrics.scope_metrics.len(), 1);
+
+    let scope_metrics = &resource_metrics.scope_metrics[0];
+    assert_eq!(scope_metrics.metrics.len(), 1);
+
+    let otlp_metric = &scope_metrics.metrics[0];
+    assert_eq!(otlp_metric.name, "test_counter");
+
+    // Should be a Sum (counter) metric
+    assert!(otlp_metric.data.is_some());
+    if let Some(vector_lib::opentelemetry::proto::metrics::v1::metric::Data::Sum(sum)) =
+        &otlp_metric.data
+    {
+        assert_eq!(sum.data_points.len(), 1);
+        assert!(sum.is_monotonic);
+
+        let data_point = &sum.data_points[0];
+        if let Some(
+            vector_lib::opentelemetry::proto::metrics::v1::number_data_point::Value::AsDouble(
+                value,
+            ),
+        ) = &data_point.value
+        {
+            assert_eq!(*value, 42.0);
+        } else {
+            panic!("Expected double value");
+        }
+
+        // Check attributes
+        assert_eq!(data_point.attributes.len(), 2);
+        let host_attr = data_point
+            .attributes
+            .iter()
+            .find(|attr| attr.key == "host")
+            .expect("Should have host attribute");
+        assert_eq!(
+            host_attr.value.as_ref().unwrap().value,
+            Some(
+                vector_lib::opentelemetry::proto::common::v1::any_value::Value::StringValue(
+                    "example.com".to_string()
+                )
+            )
+        );
+    } else {
+        panic!("Expected Sum metric data");
+    }
+}
+
+#[test]
+fn test_encode_metrics_gauge() {
+    use crate::event::{Metric, MetricKind, MetricValue};
+    use vector_lib::opentelemetry::proto::collector::metrics::v1::ExportMetricsServiceRequest;
+
+    let encoder = OtlpEncoder::new();
+
+    let metric = Metric::new(
+        "test_gauge",
+        MetricKind::Absolute,
+        MetricValue::Gauge { value: 123.5 },
+    );
+
+    let events = vec![Event::Metric(metric)];
+    let result = encoder.encode_metrics(events).unwrap();
+
+    let request = ExportMetricsServiceRequest::decode(result.as_ref()).unwrap();
+    let otlp_metric = &request.resource_metrics[0].scope_metrics[0].metrics[0];
+
+    assert_eq!(otlp_metric.name, "test_gauge");
+
+    // Should be a Gauge metric
+    if let Some(vector_lib::opentelemetry::proto::metrics::v1::metric::Data::Gauge(gauge)) =
+        &otlp_metric.data
+    {
+        assert_eq!(gauge.data_points.len(), 1);
+
+        let data_point = &gauge.data_points[0];
+        if let Some(
+            vector_lib::opentelemetry::proto::metrics::v1::number_data_point::Value::AsDouble(
+                value,
+            ),
+        ) = &data_point.value
+        {
+            assert_eq!(*value, 123.5);
+        } else {
+            panic!("Expected double value");
+        }
+    } else {
+        panic!("Expected Gauge metric data");
+    }
+}
+
+#[test]
+fn test_encode_metrics_histogram() {
+    use crate::event::metric::Bucket;
+    use crate::event::{Metric, MetricKind, MetricValue};
+    use vector_lib::opentelemetry::proto::collector::metrics::v1::ExportMetricsServiceRequest;
+
+    let encoder = OtlpEncoder::new();
+
+    let buckets = vec![
+        Bucket {
+            upper_limit: 1.0,
+            count: 10,
+        },
+        Bucket {
+            upper_limit: 5.0,
+            count: 25,
+        },
+        Bucket {
+            upper_limit: f64::INFINITY,
+            count: 30,
+        },
+    ];
+
+    let metric = Metric::new(
+        "test_histogram",
+        MetricKind::Absolute,
+        MetricValue::AggregatedHistogram {
+            buckets,
+            count: 30,
+            sum: 100.0,
+        },
+    );
+
+    let events = vec![Event::Metric(metric)];
+    let result = encoder.encode_metrics(events).unwrap();
+
+    let request = ExportMetricsServiceRequest::decode(result.as_ref()).unwrap();
+    let otlp_metric = &request.resource_metrics[0].scope_metrics[0].metrics[0];
+
+    assert_eq!(otlp_metric.name, "test_histogram");
+
+    // Should be a Histogram metric
+    if let Some(vector_lib::opentelemetry::proto::metrics::v1::metric::Data::Histogram(histogram)) =
+        &otlp_metric.data
+    {
+        assert_eq!(histogram.data_points.len(), 1);
+
+        let data_point = &histogram.data_points[0];
+        assert_eq!(data_point.count, 30);
+        assert_eq!(data_point.sum, Some(100.0));
+
+        // Check buckets - should have explicit bounds [1.0, 5.0] (infinity excluded)
+        assert_eq!(data_point.explicit_bounds, vec![1.0, 5.0]);
+        assert_eq!(data_point.bucket_counts, vec![10, 25, 30]);
+    } else {
+        panic!("Expected Histogram metric data");
+    }
+}
+
+#[test]
+fn test_metrics_partitioner() {
+    use crate::event::{Metric, MetricKind, MetricValue};
+
+    let partitioner = KeyPartitioner::new(
+        "http://localhost:4318/v1/logs".to_string(),
+        "http://localhost:4318/v1/traces".to_string(),
+        "http://localhost:4318/v1/metrics".to_string(),
+    );
+
+    let metric = Metric::new(
+        "test_metric",
+        MetricKind::Absolute,
+        MetricValue::Counter { value: 1.0 },
+    );
+    let event = Event::Metric(metric);
+
+    let key = partitioner.partition(&event);
+    assert_eq!(key.endpoint, "http://localhost:4318/v1/metrics");
+}
+
+#[test]
+fn test_encoder_routes_metrics_vs_logs() {
+    let encoder = OtlpEncoder::new();
+    let mut writer = Vec::new();
+
+    // Test that a metric event gets routed to metrics encoding
+    let metric = Metric::new(
+        "test_counter",
+        MetricKind::Absolute,
+        MetricValue::Counter { value: 5.0 },
+    );
+    let metric_event = Event::Metric(metric);
+
+    let (written_bytes, _) = encoder
+        .encode_input(vec![metric_event], &mut writer)
+        .unwrap();
+    assert!(written_bytes > 0, "Should have written metric data");
+
+    // Verify it's a valid OTLP metrics protobuf
+    let metrics_request =
+        vector_lib::opentelemetry::proto::collector::metrics::v1::ExportMetricsServiceRequest::decode(
+            writer.as_slice(),
+        );
+    assert!(
+        metrics_request.is_ok(),
+        "Should decode as OTLP metrics request"
+    );
+
+    // Clear writer for next test
+    writer.clear();
+
+    // Test that a log event gets routed to logs encoding
+    let mut log = LogEvent::from("test log message");
+    log.insert("level", "info");
+    let log_event = Event::Log(log);
+
+    let (written_bytes, _) = encoder.encode_input(vec![log_event], &mut writer).unwrap();
+    assert!(written_bytes > 0, "Should have written log data");
+
+    // Verify it's a valid OTLP logs protobuf
+    let logs_request =
+        vector_lib::opentelemetry::proto::collector::logs::v1::ExportLogsServiceRequest::decode(
+            writer.as_slice(),
+        );
+    assert!(logs_request.is_ok(), "Should decode as OTLP logs request");
+
+    // Should NOT decode as metrics request
+    writer.clear();
+    writer.extend_from_slice(&logs_request.unwrap().encode_to_vec());
+    let bad_metrics_request =
+        vector_lib::opentelemetry::proto::collector::metrics::v1::ExportMetricsServiceRequest::decode(
+            writer.as_slice(),
+        );
+    assert!(
+        bad_metrics_request.is_err(),
+        "Log protobuf should not decode as metrics"
+    );
 }
