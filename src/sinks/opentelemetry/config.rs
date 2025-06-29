@@ -21,21 +21,61 @@ use super::{
     sink::OpenTelemetrySink,
 };
 
+const DEFAULT_LOGS_PATH: &str = "/v1/logs";
+const DEFAULT_METRICS_PATH: &str = "/v1/metrics";
+const DEFAULT_TRACES_PATH: &str = "/v1/traces";
+
+fn default_logs_path() -> String {
+    DEFAULT_LOGS_PATH.to_string()
+}
+
+fn default_metrics_path() -> String {
+    DEFAULT_METRICS_PATH.to_string()
+}
+
+fn default_traces_path() -> String {
+    DEFAULT_TRACES_PATH.to_string()
+}
+
 /// Configuration for the `opentelemetry` sink.
+///
+/// This sink sends observability data to OpenTelemetry-compatible collectors
+/// using the OTLP (OpenTelemetry Protocol) specification. Currently only HTTP
+/// transport is supported, but gRPC support is planned for future releases.
 #[configurable_component(sink("opentelemetry", "Deliver OTLP data over HTTP and gRPC."))]
 #[derive(Clone, Debug)]
 pub struct OpenTelemetryConfig {
     /// The base endpoint for the OTLP collector.
     ///
-    /// The sink will append the appropriate signal-specific path, e.g., `/v1/logs`.
+    /// The path values are appended to this base URL.
     #[configurable(validation(format = "uri"))]
     #[configurable(metadata(docs::examples = "http://localhost:4318"))]
-    endpoint: String,
+    pub endpoint: String,
+
+    /// The path to use for logs.
+    #[serde(default = "default_logs_path")]
+    #[configurable(metadata(docs::examples = "/v1/logs"))]
+    #[configurable(metadata(docs::examples = "/custom/logs"))]
+    pub logs_path: String,
+
+    /// The path to use for metrics.
+    #[serde(default = "default_metrics_path")]
+    #[configurable(metadata(docs::examples = "/v1/metrics"))]
+    #[configurable(metadata(docs::examples = "/custom/metrics"))]
+    pub metrics_path: String,
+
+    /// The path to use for traces.
+    #[serde(default = "default_traces_path")]
+    #[configurable(metadata(docs::examples = "/v1/traces"))]
+    #[configurable(metadata(docs::examples = "/custom/traces"))]
+    pub traces_path: String,
 
     /// The protocol to use for sending data.
+    ///
+    /// Currently only HTTP is supported. gRPC support is planned for future releases.
     #[configurable(derived)]
     #[serde(default)]
-    protocol: OtlpProtocol,
+    pub protocol: OtlpProtocol,
 
     #[configurable(derived)]
     #[serde(default)]
@@ -58,19 +98,29 @@ pub struct OpenTelemetryConfig {
 }
 
 /// The protocol used to send OTLP data.
+///
+/// Currently only HTTP is supported, but gRPC support is planned for future releases.
+/// The OTLP specification supports both HTTP and gRPC transports, and this enum
+/// will be extended to include gRPC once the implementation is complete.
 #[configurable_component]
 #[derive(Clone, Debug, Default)]
 pub enum OtlpProtocol {
     /// Send data over HTTP with Protobuf encoding.
+    ///
+    /// Uses the OTLP/HTTP protocol as defined in the OpenTelemetry specification.
+    /// Data is sent as binary-encoded Protocol Buffers over HTTP POST requests.
     #[default]
     Http,
-    // Grpc, // To be implemented in the future
+    // Grpc, // TODO: gRPC support to be implemented in future releases
 }
 
 impl Default for OpenTelemetryConfig {
     fn default() -> Self {
         Self {
             endpoint: "http://localhost:4318".to_string(),
+            logs_path: DEFAULT_LOGS_PATH.to_string(),
+            metrics_path: DEFAULT_METRICS_PATH.to_string(),
+            traces_path: DEFAULT_TRACES_PATH.to_string(),
             protocol: OtlpProtocol::default(),
             auth: None,
             request: RequestConfig::default(),
@@ -125,9 +175,9 @@ impl OpenTelemetryConfig {
         let endpoint = UriSerde::from_str(&self.endpoint)?;
 
         // The full paths for each signal type.
-        let logs_endpoint = endpoint.append_path("v1/logs")?;
-        let traces_endpoint = endpoint.append_path("v1/traces")?;
-        let metrics_endpoint = endpoint.append_path("v1/metrics")?;
+        let logs_endpoint = endpoint.append_path(&self.logs_path.trim_start_matches('/'))?;
+        let traces_endpoint = endpoint.append_path(&self.traces_path.trim_start_matches('/'))?;
+        let metrics_endpoint = endpoint.append_path(&self.metrics_path.trim_start_matches('/'))?;
 
         let service_builder = OtlpServiceRequestBuilder {
             auth: self.auth.clone(),

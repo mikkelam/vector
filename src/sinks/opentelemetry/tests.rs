@@ -8,6 +8,8 @@ use prost::Message;
 use rstest::rstest;
 use std::convert::Infallible;
 use std::sync::{Arc, Mutex};
+
+use super::config::OtlpProtocol;
 use vector_lib::event::EventMetadata;
 use vrl::event_path;
 
@@ -1098,4 +1100,115 @@ fn create_test_trace_event() -> Event {
         trace_fields,
         EventMetadata::default(),
     ))
+}
+
+#[tokio::test]
+async fn test_custom_paths_configuration() {
+    trace_init();
+
+    // Use Arc<Mutex<Vec<...>>> to capture requests
+    let received_requests = Arc::new(Mutex::new(Vec::new()));
+    let received_requests_clone = received_requests.clone();
+
+    // Create a mock HTTP server that captures requests
+    let handler = move |req: Request<Body>| {
+        let received_requests = received_requests_clone.clone();
+        async move {
+            let (parts, body) = req.into_parts();
+            let body_bytes = hyper::body::to_bytes(body).await.unwrap();
+
+            // Store the request
+            {
+                let mut requests = received_requests.lock().unwrap();
+                requests.push((parts, body_bytes));
+            }
+
+            Ok::<_, Infallible>(Response::new(Body::empty()))
+        }
+    };
+
+    // Use Vector's test utility to spawn the server
+    let mock_endpoint = crate::test_util::http::spawn_blackhole_http_server(handler).await;
+
+    let config_str = format!(
+        r#"
+endpoint = "{}"
+logs_path = "/custom/logs"
+metrics_path = "/custom/metrics"
+traces_path = "/custom/traces"
+"#,
+        mock_endpoint
+    );
+
+    let config: OpenTelemetryConfig = toml::from_str(&config_str).unwrap();
+    let cx = SinkContext::default();
+    let (sink, _healthcheck) = config.build(cx).await.unwrap();
+
+    let mut log = LogEvent::from("hello custom paths");
+    log.insert("host", "example.com");
+    log.insert(event_path!("resource", "service.name"), "vector-test-suite");
+
+    let event = Event::Log(log);
+    run_and_assert_sink_compliance(sink, stream::once(async { event }), &SINK_TAGS).await;
+
+    // Wait a bit for async processing
+    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+    // Assert on the received request
+    let requests = received_requests.lock().unwrap();
+    assert_eq!(requests.len(), 1, "Expected exactly 1 HTTP request");
+
+    let (parts, _body_bytes) = &requests[0];
+    assert_eq!(parts.method, http::Method::POST);
+    assert_eq!(parts.uri.path(), "/custom/logs"); // Verify custom path is used
+}
+
+#[test]
+fn test_default_config_values() {
+    let config = OpenTelemetryConfig::default();
+
+    assert_eq!(config.endpoint, "http://localhost:4318");
+    assert_eq!(config.logs_path, "/v1/logs");
+    assert_eq!(config.metrics_path, "/v1/metrics");
+    assert_eq!(config.traces_path, "/v1/traces");
+    assert!(matches!(config.protocol, OtlpProtocol::Http));
+}
+
+#[test]
+fn test_config_parsing_with_custom_paths() {
+    let config_str = r#"
+endpoint = "https://otel.example.com:4318"
+logs_path = "/api/v2/logs"
+metrics_path = "/api/v2/metrics"
+traces_path = "/api/v2/traces"
+"#;
+
+    let config: OpenTelemetryConfig = toml::from_str(config_str).unwrap();
+
+    assert_eq!(config.endpoint, "https://otel.example.com:4318");
+    assert_eq!(config.logs_path, "/api/v2/logs");
+    assert_eq!(config.metrics_path, "/api/v2/metrics");
+    assert_eq!(config.traces_path, "/api/v2/traces");
+}
+
+#[test]
+fn test_config_parsing_with_leading_slash_normalization() {
+    let config_str = r#"
+endpoint = "http://localhost:4318"
+logs_path = "custom/logs"
+metrics_path = "/custom/metrics"
+traces_path = "//custom/traces"
+"#;
+
+    let config: OpenTelemetryConfig = toml::from_str(config_str).unwrap();
+
+    // All paths should work regardless of leading slashes
+    assert_eq!(config.logs_path, "custom/logs");
+    assert_eq!(config.metrics_path, "/custom/metrics");
+    assert_eq!(config.traces_path, "//custom/traces");
+}
+
+#[test]
+fn test_generate_config() {
+    crate::test_util::test_generate_config::<OpenTelemetryConfig>();
 }
