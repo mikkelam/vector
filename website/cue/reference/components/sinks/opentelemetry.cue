@@ -1,7 +1,7 @@
 package metadata
 
 components: sinks: opentelemetry: {
-	title: "Open Telemetry"
+	title: "OpenTelemetry (OTLP)"
 
 	classes: {
 		commonly_used: false
@@ -31,9 +31,9 @@ components: sinks: opentelemetry: {
 	}
 
 	support: {
-		requirements: ["This sink accepts events conforming to the [OTEL proto format](\(urls.opentelemetry_proto)). You can use [Remap](\(urls.vector_remap_transform)) to prepare events for ingestion."]
+		requirements: ["This sink sends data using the native OTLP (OpenTelemetry Protocol) over HTTP with binary Protocol Buffers encoding."]
 		warnings: []
-		notices: []
+		notices: ["Currently supports HTTP transport only. gRPC support is planned for future releases."]
 	}
 
 	configuration: base.components.sinks.opentelemetry.configuration
@@ -41,194 +41,95 @@ components: sinks: opentelemetry: {
 		quickstart: {
 			title: "Quickstart"
 			body: """
-				This sink is a wrapper over the HTTP sink. The following is an example of how you can push OTEL logs to an OTEL collector.
+				This sink sends observability data using the native OTLP (OpenTelemetry Protocol) over HTTP. It automatically handles logs, metrics, and traces, routing them to the appropriate endpoints.
 
-				1. The Vector config:
+				## Basic Configuration
+
+				```yaml
+				# Simple setup for all signal types
+				[sinks.otlp]
+				type = "opentelemetry"
+				endpoint = "http://localhost:4318"
+				inputs = ["logs", "metrics", "traces"]
+				```
+
+				## Custom Paths
+
+				```yaml
+				# Custom endpoint paths for enterprise setups
+				[sinks.otlp_custom]
+				type = "opentelemetry"
+				endpoint = "https://otel.company.com"
+				logs_path = "/api/v2/logs"
+				metrics_path = "/api/v2/metrics"
+				traces_path = "/api/v2/traces"
+				```
+
+				## Complete Example with OTEL Collector
+
+				1. **Vector Configuration:**
 
 				```yaml
 				sources:
-					generate_syslog:
-						type: "demo_logs"
-						format: "syslog"
-						count: 100000
-						interval: 1
+				  demo_logs:
+				    type: "demo_logs"
+				    format: "syslog"
+				    count: 1000
+				    interval: 1
 
-				transforms:
-					remap_syslog:
-						inputs: ["generate_syslog"]
-						type: "remap"
-						source: |
-							syslog = parse_syslog!(.message)
-
-							severity_text = if includes(["emerg", "err", "crit", "alert"], syslog.severity) {
-								"ERROR"
-							} else if syslog.severity == "warning" {
-								"WARN"
-							} else if syslog.severity == "debug" {
-								"DEBUG"
-							} else if includes(["info", "notice"], syslog.severity) {
-								"INFO"
-							} else {
-								syslog.severity
-							}
-
-							.resourceLogs = [{
-								"resource": {
-									"attributes": [
-										{ "key": "source_type", "value": { "stringValue": .source_type } },
-										{ "key": "service.name", "value": { "stringValue": syslog.appname } },
-										{ "key": "host.hostname", "value": { "stringValue": syslog.hostname } }
-									]
-								},
-								"scopeLogs": [{
-									"scope": {
-										"name": syslog.msgid
-									},
-									"logRecords": [{
-										"timeUnixNano": to_unix_timestamp!(syslog.timestamp, unit: "nanoseconds"),
-										"body": { "stringValue": syslog.message },
-										"severityText": severity_text,
-										"attributes": [
-											{ "key": "syslog.procid", "value": { "stringValue": to_string(syslog.procid) } },
-											{ "key": "syslog.facility", "value": { "stringValue": syslog.facility } },
-											{ "key": "syslog.version", "value": { "stringValue": to_string(syslog.version) } }
-										]
-									}]
-								}]
-							}]
-
-							del(.message)
-							del(.timestamp)
-							del(.service)
-							del(.source_type)
+				  host_metrics:
+				    type: "host_metrics"
+				    collectors: ["cpu", "memory"]
 
 				sinks:
-					emit_syslog:
-						inputs: ["remap_syslog"]
-						type: opentelemetry
-						protocol:
-							type: http
-							uri: http://localhost:5318/v1/logs
-							method: post
-							encoding:
-								codec: json
-							framing:
-								method: newline_delimited
-							headers:
-								content-type: application/json
+				  otlp_sink:
+				    type: "opentelemetry"
+				    inputs: ["demo_logs", "host_metrics"]
+				    endpoint: "http://localhost:4318"
 				```
 
-				2. Sample OTEL collector config:
+				2. **OTEL Collector Configuration:**
 
 				```yaml
 				receivers:
-					otlp:
-						protocols:
-							http:
-								endpoint: "0.0.0.0:5318"
+				  otlp:
+				    protocols:
+				      http:
+				        endpoint: "0.0.0.0:4318"
 
 				exporters:
-					debug:
-						verbosity: detailed
-					otlp:
-						endpoint: localhost:4317
-						tls:
-							insecure: true
-
-				processors:
-					batch: {}
+				  debug:
+				    verbosity: detailed
+				  jaeger:
+				    endpoint: localhost:14250
+				    tls:
+				      insecure: true
 
 				service:
-					pipelines:
-						logs:
-							receivers: [otlp]
-							processors: [batch]
-							exporters: [debug]
+				  pipelines:
+				    logs:
+				      receivers: [otlp]
+				      exporters: [debug]
+				    metrics:
+				      receivers: [otlp]
+				      exporters: [debug]
+				    traces:
+				      receivers: [otlp]
+				      exporters: [debug, jaeger]
 				```
 
-				3. Run the OTEL instance:
+				## How It Works
 
-				```sh
-				./otelcol --config ./otel/config.yaml
-				```
+				- **Automatic Routing**: Data is automatically sent to `/v1/logs`, `/v1/metrics`, or `/v1/traces` based on signal type
+				- **Native OTLP**: Uses binary Protocol Buffers encoding for optimal performance
+				- **Log Level Parsing**: Automatically extracts severity from `level`, `severity`, or `log_level` fields
+				- **Resource Handling**: For logs, extracts resource attributes from `resource` field if present. Metrics and traces use empty resources for transparency.
 
-				4. Run Vector:
+				## Current Limitations
 
-				```sh
-				VECTOR_LOG=debug cargo run -- --config /path/to/vector/config.yaml
-				```
-
-				In the console for the OTEL Collector you can see the logs and their contents as they come in.
-
-				Here's an example of a JSON payload you might see from Vector:
-
-				```json
-				{
-				  "host": "localhost",
-				  "resourceLogs": [
-					{
-					  "resource": {
-						"attributes": [
-						  {
-							"key": "source_type",
-							"value": {
-							  "stringValue": "demo_logs"
-							}
-						  },
-						  {
-							"key": "service.name",
-							"value": {
-							  "stringValue": "shaneIxD"
-							}
-						  },
-						  {
-							"key": "host.hostname",
-							"value": {
-							  "stringValue": "random.org"
-							}
-						  }
-						]
-					  },
-					  "scopeLogs": [
-						{
-						  "logRecords": [
-							{
-							  "attributes": [
-								{
-								  "key": "syslog.procid",
-								  "value": {
-									"stringValue": "7906"
-								  }
-								},
-								{
-								  "key": "syslog.facility",
-								  "value": {
-									"stringValue": "local0"
-								  }
-								},
-								{
-								  "key": "syslog.version",
-								  "value": {
-									"stringValue": "1"
-								  }
-								}
-							  ],
-							  "body": {
-								"stringValue": "Maybe we just shouldn't use computers"
-							  },
-							  "severityText": "WARN",
-							  "timeUnixNano": 1737045415051000000
-							}
-						  ],
-						  "scope": {
-							"name": "ID856"
-						  }
-						}
-					  ]
-					}
-				  ]
-				}
-				```
+				- **Transport**: HTTP only (gRPC support planned for future releases)
+				- **Encoding**: Binary Protocol Buffers only
+				- **Status**: Beta - configuration may change in future versions
 
 				"""
 		}
