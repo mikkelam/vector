@@ -5,11 +5,13 @@
 use std::io;
 
 use bytes::Bytes;
+use hex;
 
 use prost::Message;
 use vector_lib::opentelemetry::proto::{
     collector::logs::v1::ExportLogsServiceRequest,
     collector::metrics::v1::ExportMetricsServiceRequest,
+    collector::trace::v1::ExportTraceServiceRequest,
     common::v1::{any_value::Value as PbValue, AnyValue, KeyValue, KeyValueList},
     logs::v1::{LogRecord, ResourceLogs, ScopeLogs, SeverityNumber},
     metrics::v1::{
@@ -19,6 +21,10 @@ use vector_lib::opentelemetry::proto::{
         Sum, Summary, SummaryDataPoint,
     },
     resource::v1::Resource,
+    trace::v1::{
+        span::{Event as SpanEvent, Link, SpanKind},
+        ResourceSpans, ScopeSpans, Span, Status as SpanStatus,
+    },
 };
 use vrl::{
     event_path,
@@ -26,7 +32,7 @@ use vrl::{
 };
 
 use crate::{
-    event::{Event, LogEvent, Metric as VectorMetric, MetricKind, MetricValue},
+    event::{Event, LogEvent, Metric as VectorMetric, MetricKind, MetricValue, TraceEvent},
     sinks::prelude::*,
 };
 
@@ -186,13 +192,41 @@ impl OtlpEncoder {
         Ok(request.encode_to_vec().into())
     }
 
-    #[allow(dead_code, unused_variables)]
-    fn encode_traces(&self, events: Vec<Event>) -> Result<Bytes, ()> {
-        // TODO: Implement trace encoding
-        emit!(SinkRequestBuildError {
-            error: "Trace encoding is not yet implemented for the OTLP sink."
-        });
-        Err(())
+    pub fn encode_traces(&self, events: Vec<Event>) -> Result<Bytes, ()> {
+        let mut span_records = Vec::new();
+
+        // Vector trace events typically don't have resource-level attributes.
+        // Similar to metrics, we keep resource attributes empty to preserve transparency.
+        let resource_attributes = Vec::new();
+
+        for event in events {
+            let trace = event.into_trace();
+            let otlp_span = convert_vector_trace_to_otlp_span(trace);
+            span_records.push(otlp_span);
+        }
+
+        let scope_spans = vec![ScopeSpans {
+            // Vector acts as a transparent aggregator/router, not the original instrumentation library.
+            // Setting scope to None preserves the original instrumentation context from upstream sources.
+            // Per OTLP spec, scope identifies "the logical unit of software that emits the telemetry" -
+            // that's the original application, not Vector as the intermediary.
+            scope: None,
+            spans: span_records,
+            schema_url: String::new(),
+        }];
+
+        let resource_spans = vec![ResourceSpans {
+            resource: Some(Resource {
+                attributes: resource_attributes,
+                dropped_attributes_count: 0,
+            }),
+            scope_spans,
+            schema_url: String::new(),
+        }];
+
+        let request = ExportTraceServiceRequest { resource_spans };
+
+        Ok(request.encode_to_vec().into())
     }
 }
 
@@ -544,4 +578,203 @@ fn convert_vector_metric_to_otlp(metric: VectorMetric) -> OtlpMetric {
         unit,
         data,
     }
+}
+
+fn convert_vector_trace_to_otlp_span(trace: TraceEvent) -> Span {
+    let trace_map = trace.as_map();
+
+    // Extract required fields with fallbacks
+    let trace_id = trace_map
+        .get("trace_id")
+        .and_then(|v| v.as_str())
+        .map(|s| hex_string_to_bytes(s.as_ref()))
+        .unwrap_or_default();
+
+    let span_id = trace_map
+        .get("span_id")
+        .and_then(|v| v.as_str())
+        .map(|s| hex_string_to_bytes(s.as_ref()))
+        .unwrap_or_default();
+
+    let parent_span_id = trace_map
+        .get("parent_span_id")
+        .and_then(|v| v.as_str())
+        .map(|s| hex_string_to_bytes(s.as_ref()))
+        .unwrap_or_default();
+
+    let name = trace_map
+        .get("name")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| "unknown".to_string());
+
+    let kind = trace_map
+        .get("kind")
+        .and_then(|v| v.as_integer())
+        .unwrap_or(SpanKind::Internal as i64) as i32;
+
+    let trace_state = trace_map
+        .get("trace_state")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| "".to_string());
+
+    // Convert timestamps from Vector's DateTime to nanoseconds
+    let start_time_unix_nano = trace_map
+        .get("start_time_unix_nano")
+        .and_then(|v| v.as_timestamp())
+        .and_then(|ts| ts.timestamp_nanos_opt())
+        .unwrap_or(0) as u64;
+
+    let end_time_unix_nano = trace_map
+        .get("end_time_unix_nano")
+        .and_then(|v| v.as_timestamp())
+        .and_then(|ts| ts.timestamp_nanos_opt())
+        .unwrap_or(0) as u64;
+
+    // Convert attributes
+    let attributes = trace_map
+        .get("attributes")
+        .and_then(|v| v.as_object())
+        .map(|obj| convert_object_map_to_key_value_vec(obj.clone()))
+        .unwrap_or_default();
+
+    let dropped_attributes_count = trace_map
+        .get("dropped_attributes_count")
+        .and_then(|v| v.as_integer())
+        .unwrap_or(0) as u32;
+
+    // Convert events
+    let events = trace_map
+        .get("events")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|event_val| convert_value_to_span_event(event_val))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let dropped_events_count = trace_map
+        .get("dropped_events_count")
+        .and_then(|v| v.as_integer())
+        .unwrap_or(0) as u32;
+
+    // Convert links
+    let links = trace_map
+        .get("links")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|link_val| convert_value_to_span_link(link_val))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let dropped_links_count = trace_map
+        .get("dropped_links_count")
+        .and_then(|v| v.as_integer())
+        .unwrap_or(0) as u32;
+
+    // Convert status
+    let status = trace_map
+        .get("status")
+        .and_then(|v| v.as_object())
+        .map(|obj| SpanStatus {
+            message: obj
+                .get("message")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| "".to_string()),
+            code: obj.get("code").and_then(|v| v.as_integer()).unwrap_or(0) as i32,
+        });
+
+    Span {
+        trace_id,
+        span_id,
+        trace_state,
+        parent_span_id,
+        name,
+        kind,
+        start_time_unix_nano,
+        end_time_unix_nano,
+        attributes,
+        dropped_attributes_count,
+        events,
+        dropped_events_count,
+        links,
+        dropped_links_count,
+        status,
+    }
+}
+
+fn hex_string_to_bytes(hex_str: &str) -> Vec<u8> {
+    hex::decode(hex_str).unwrap_or_default()
+}
+
+fn convert_value_to_span_event(value: &Value) -> Option<SpanEvent> {
+    let obj = value.as_object()?;
+
+    let name = obj.get("name")?.as_str()?.to_string();
+    let time_unix_nano = obj
+        .get("time_unix_nano")?
+        .as_timestamp()?
+        .timestamp_nanos_opt()? as u64;
+
+    let attributes = obj
+        .get("attributes")
+        .and_then(|v| v.as_object())
+        .map(|obj| convert_object_map_to_key_value_vec(obj.clone()))
+        .unwrap_or_default();
+
+    let dropped_attributes_count = obj
+        .get("dropped_attributes_count")
+        .and_then(|v| v.as_integer())
+        .unwrap_or(0) as u32;
+
+    Some(SpanEvent {
+        time_unix_nano,
+        name,
+        attributes,
+        dropped_attributes_count,
+    })
+}
+
+fn convert_value_to_span_link(value: &Value) -> Option<Link> {
+    let obj = value.as_object()?;
+
+    let trace_id = obj
+        .get("trace_id")?
+        .as_str()
+        .map(|s| hex_string_to_bytes(s.as_ref()))?;
+
+    let span_id = obj
+        .get("span_id")?
+        .as_str()
+        .map(|s| hex_string_to_bytes(s.as_ref()))?;
+
+    let trace_state = obj
+        .get("trace_state")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| "".to_string());
+
+    let attributes = obj
+        .get("attributes")
+        .and_then(|v| v.as_object())
+        .map(|obj| convert_object_map_to_key_value_vec(obj.clone()))
+        .unwrap_or_default();
+
+    let dropped_attributes_count = obj
+        .get("dropped_attributes_count")
+        .and_then(|v| v.as_integer())
+        .unwrap_or(0) as u32;
+
+    Some(Link {
+        trace_id,
+        span_id,
+        trace_state,
+        attributes,
+        dropped_attributes_count,
+    })
 }

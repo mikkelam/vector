@@ -1,5 +1,6 @@
 //! Unit and integration tests for the `opentelemetry` sink.
 
+use chrono::{TimeZone, Utc};
 use futures::stream;
 use http::{Request, Response};
 use hyper::Body;
@@ -7,6 +8,7 @@ use prost::Message;
 use rstest::rstest;
 use std::convert::Infallible;
 use std::sync::{Arc, Mutex};
+use vector_lib::event::EventMetadata;
 use vrl::event_path;
 
 use crate::{
@@ -42,7 +44,7 @@ fn generate_config() {
     )),
     "http://localhost:4318/v1/metrics"
 )]
-// TODO: Add trace event test case once trace event generation is easier
+#[case(create_test_trace_event(), "http://localhost:4318/v1/traces")]
 fn test_partitioner(#[case] event: Event, #[case] expected_endpoint: &str) {
     let partitioner = KeyPartitioner::new(
         "http://localhost:4318/v1/logs".to_string(),
@@ -190,6 +192,94 @@ endpoint = "{}"
         .iter()
         .find(|attr| attr.key == "timestamp")
         .expect("Should have timestamp attribute");
+}
+
+#[tokio::test]
+async fn test_http_trace_request() {
+    use vector_lib::opentelemetry::proto::collector::trace::v1::ExportTraceServiceRequest;
+
+    trace_init();
+
+    // Use Arc<Mutex<Vec<...>>> to capture requests
+    let received_requests = Arc::new(Mutex::new(Vec::new()));
+    let received_requests_clone = received_requests.clone();
+
+    // Create a mock HTTP server that captures requests
+    let handler = move |req: Request<Body>| {
+        let received_requests = received_requests_clone.clone();
+        async move {
+            let (parts, body) = req.into_parts();
+            let body_bytes = hyper::body::to_bytes(body).await.unwrap();
+
+            // Store the request
+            {
+                let mut requests = received_requests.lock().unwrap();
+                requests.push((parts, body_bytes));
+            }
+
+            Ok::<_, Infallible>(Response::new(Body::empty()))
+        }
+    };
+
+    // Use Vector's test utility to spawn the server
+    let mock_endpoint = crate::test_util::http::spawn_blackhole_http_server(handler).await;
+
+    let config_str = format!(
+        r#"
+endpoint = "{}"
+"#,
+        mock_endpoint
+    );
+
+    let config: OpenTelemetryConfig = toml::from_str(&config_str).unwrap();
+    let cx = SinkContext::default();
+    let (sink, _healthcheck) = config.build(cx).await.unwrap();
+
+    let trace_event = create_test_trace_event();
+    run_and_assert_sink_compliance(sink, stream::once(async { trace_event }), &SINK_TAGS).await;
+
+    // Wait a bit for async processing
+    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+    // Assert on the received request
+    let requests = received_requests.lock().unwrap();
+    assert_eq!(requests.len(), 1, "Expected exactly 1 HTTP request");
+
+    let (parts, body_bytes) = &requests[0];
+
+    assert_eq!(parts.method, http::Method::POST);
+    assert_eq!(parts.uri.path(), "/v1/traces");
+    assert_eq!(
+        parts.headers.get("content-type").unwrap(),
+        "application/x-protobuf"
+    );
+
+    let request = ExportTraceServiceRequest::decode(body_bytes.as_ref()).unwrap();
+
+    assert_eq!(request.resource_spans.len(), 1);
+    let resource_spans = &request.resource_spans[0];
+
+    // Check scope spans
+    assert_eq!(resource_spans.scope_spans.len(), 1);
+    let scope_spans = &resource_spans.scope_spans[0];
+
+    // Check spans
+    assert_eq!(scope_spans.spans.len(), 1);
+    let otlp_span = &scope_spans.spans[0];
+
+    // Verify span details
+    assert_eq!(otlp_span.name, "test_span");
+    assert_eq!(
+        hex::encode(&otlp_span.trace_id),
+        "0102030405060708090a0b0c0d0e0f10"
+    );
+    assert_eq!(hex::encode(&otlp_span.span_id), "0102030405060708");
+    assert_eq!(otlp_span.kind, 1); // SPAN_KIND_INTERNAL
+
+    // Verify timestamps are non-zero
+    assert!(otlp_span.start_time_unix_nano > 0);
+    assert!(otlp_span.end_time_unix_nano > 0);
+    assert!(otlp_span.end_time_unix_nano > otlp_span.start_time_unix_nano);
 }
 
 #[test]
@@ -819,4 +909,193 @@ fn test_encoder_routes_metrics_vs_logs() {
         bad_metrics_request.is_err(),
         "Log protobuf should not decode as metrics"
     );
+}
+
+#[test]
+fn test_encode_traces_basic() {
+    use vector_lib::opentelemetry::proto::collector::trace::v1::ExportTraceServiceRequest;
+
+    let encoder = OtlpEncoder::new();
+    let trace_event = create_test_trace_event();
+
+    let events = vec![trace_event];
+    let result = encoder.encode_traces(events).unwrap();
+
+    // Should have non-empty protobuf bytes
+    assert!(!result.is_empty());
+
+    // Decode and verify the structure
+    let request = ExportTraceServiceRequest::decode(result.as_ref()).unwrap();
+    assert_eq!(request.resource_spans.len(), 1);
+
+    let resource_spans = &request.resource_spans[0];
+    assert_eq!(resource_spans.scope_spans.len(), 1);
+
+    let scope_spans = &resource_spans.scope_spans[0];
+    assert_eq!(scope_spans.spans.len(), 1);
+
+    let otlp_span = &scope_spans.spans[0];
+    assert_eq!(otlp_span.name, "test_span");
+    assert_eq!(
+        hex::encode(&otlp_span.trace_id),
+        "0102030405060708090a0b0c0d0e0f10"
+    );
+    assert_eq!(hex::encode(&otlp_span.span_id), "0102030405060708");
+}
+
+#[test]
+fn test_encode_traces_with_attributes() {
+    use std::collections::BTreeMap;
+    use vrl::value::Value;
+
+    let encoder = OtlpEncoder::new();
+
+    // Create trace with attributes
+    let mut trace_fields = BTreeMap::new();
+    trace_fields.insert(
+        "trace_id".into(),
+        Value::from("0102030405060708090a0b0c0d0e0f10"),
+    );
+    trace_fields.insert("span_id".into(), Value::from("0102030405060708"));
+    trace_fields.insert("name".into(), Value::from("test_span"));
+    trace_fields.insert("kind".into(), Value::from(1));
+    trace_fields.insert(
+        "start_time_unix_nano".into(),
+        Value::from(Utc.timestamp_nanos(1234567890000000000)),
+    );
+    trace_fields.insert(
+        "end_time_unix_nano".into(),
+        Value::from(Utc.timestamp_nanos(1234567891000000000)),
+    );
+
+    // Add attributes
+    let mut attributes = BTreeMap::new();
+    attributes.insert("http.method".into(), Value::from("GET"));
+    attributes.insert("http.status_code".into(), Value::from(200));
+    trace_fields.insert("attributes".into(), Value::Object(attributes));
+
+    let trace_event = Event::Trace(crate::event::TraceEvent::from_parts(
+        trace_fields,
+        EventMetadata::default(),
+    ));
+    let events = vec![trace_event];
+    let result = encoder.encode_traces(events).unwrap();
+
+    // Decode and verify attributes
+    let request =
+        vector_lib::opentelemetry::proto::collector::trace::v1::ExportTraceServiceRequest::decode(
+            result.as_ref(),
+        )
+        .unwrap();
+    let otlp_span = &request.resource_spans[0].scope_spans[0].spans[0];
+
+    assert_eq!(otlp_span.attributes.len(), 2);
+    let method_attr = otlp_span
+        .attributes
+        .iter()
+        .find(|attr| attr.key == "http.method")
+        .unwrap();
+    assert_eq!(
+        method_attr.value.as_ref().unwrap().value,
+        Some(
+            vector_lib::opentelemetry::proto::common::v1::any_value::Value::StringValue(
+                "GET".to_string()
+            )
+        )
+    );
+}
+
+#[test]
+fn test_encode_traces_with_events() {
+    use std::collections::BTreeMap;
+    use vrl::value::Value;
+
+    let encoder = OtlpEncoder::new();
+
+    // Create trace with span events
+    let mut trace_fields = BTreeMap::new();
+    trace_fields.insert(
+        "trace_id".into(),
+        Value::from("0102030405060708090a0b0c0d0e0f10"),
+    );
+    trace_fields.insert("span_id".into(), Value::from("0102030405060708"));
+    trace_fields.insert("name".into(), Value::from("test_span"));
+
+    // Add events
+    let mut event_obj = BTreeMap::new();
+    event_obj.insert("name".into(), Value::from("test_event"));
+    event_obj.insert(
+        "time_unix_nano".into(),
+        Value::from(Utc.timestamp_nanos(1234567890500000000)),
+    );
+    event_obj.insert("attributes".into(), Value::Object(BTreeMap::new()));
+    event_obj.insert("dropped_attributes_count".into(), Value::from(0));
+
+    let events_array = vec![Value::Object(event_obj)];
+    trace_fields.insert("events".into(), Value::Array(events_array));
+
+    let trace_event = Event::Trace(crate::event::TraceEvent::from_parts(
+        trace_fields,
+        EventMetadata::default(),
+    ));
+    let events = vec![trace_event];
+    let result = encoder.encode_traces(events).unwrap();
+
+    // Decode and verify events
+    let request =
+        vector_lib::opentelemetry::proto::collector::trace::v1::ExportTraceServiceRequest::decode(
+            result.as_ref(),
+        )
+        .unwrap();
+    let otlp_span = &request.resource_spans[0].scope_spans[0].spans[0];
+
+    assert_eq!(otlp_span.events.len(), 1);
+    assert_eq!(otlp_span.events[0].name, "test_event");
+}
+
+#[test]
+fn test_traces_partitioner() {
+    let partitioner = KeyPartitioner::new(
+        "http://localhost:4318/v1/logs".to_string(),
+        "http://localhost:4318/v1/traces".to_string(),
+        "http://localhost:4318/v1/metrics".to_string(),
+    );
+
+    let trace_event = create_test_trace_event();
+    let key = partitioner.partition(&trace_event);
+    assert_eq!(key.endpoint, "http://localhost:4318/v1/traces");
+}
+
+fn create_test_trace_event() -> Event {
+    use std::collections::BTreeMap;
+    use vrl::value::Value;
+
+    let mut trace_fields = BTreeMap::new();
+    trace_fields.insert(
+        "trace_id".into(),
+        Value::from("0102030405060708090a0b0c0d0e0f10"),
+    );
+    trace_fields.insert("span_id".into(), Value::from("0102030405060708"));
+    trace_fields.insert("parent_span_id".into(), Value::from(""));
+    trace_fields.insert("name".into(), Value::from("test_span"));
+    trace_fields.insert("kind".into(), Value::from(1)); // SPAN_KIND_INTERNAL
+    trace_fields.insert(
+        "start_time_unix_nano".into(),
+        Value::from(Utc.timestamp_nanos(1234567890000000000)),
+    );
+    trace_fields.insert(
+        "end_time_unix_nano".into(),
+        Value::from(Utc.timestamp_nanos(1234567891000000000)),
+    );
+    trace_fields.insert("attributes".into(), Value::Object(BTreeMap::new()));
+    trace_fields.insert("dropped_attributes_count".into(), Value::from(0));
+    trace_fields.insert("events".into(), Value::Array(Vec::new()));
+    trace_fields.insert("dropped_events_count".into(), Value::from(0));
+    trace_fields.insert("links".into(), Value::Array(Vec::new()));
+    trace_fields.insert("dropped_links_count".into(), Value::from(0));
+
+    Event::Trace(crate::event::TraceEvent::from_parts(
+        trace_fields,
+        EventMetadata::default(),
+    ))
 }
