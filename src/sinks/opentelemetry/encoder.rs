@@ -10,7 +10,7 @@ use prost::Message;
 use vector_lib::opentelemetry::proto::{
     collector::logs::v1::ExportLogsServiceRequest,
     common::v1::{any_value::Value as PbValue, AnyValue, KeyValue, KeyValueList},
-    logs::v1::{LogRecord, ResourceLogs, ScopeLogs},
+    logs::v1::{LogRecord, ResourceLogs, ScopeLogs, SeverityNumber},
     resource::v1::Resource,
 };
 use vrl::{
@@ -48,7 +48,8 @@ impl OtlpEncoder {
             if resource_attributes.is_empty() {
                 if let Some(resource_map) = log.remove(event_path!("resource")) {
                     if let Some(resource_obj) = resource_map.as_object() {
-                        resource_attributes = convert_object_map_to_key_value_vec(resource_obj.clone());
+                        resource_attributes =
+                            convert_object_map_to_key_value_vec(resource_obj.clone());
                     }
                 }
             } else {
@@ -92,6 +93,7 @@ impl OtlpEncoder {
             .and_then(|ts| ts.timestamp_nanos_opt())
             .unwrap_or(0) as u64;
 
+        // Value of 0 indicates unknown or missing timestamp
         let observed_time_unix_nano = log
             .remove(event_path!("observed_timestamp"))
             .and_then(|v| v.as_timestamp().copied())
@@ -109,6 +111,9 @@ impl OtlpEncoder {
             .and_then(|v| v.as_bytes().map(|b| b.to_vec()))
             .unwrap_or_default();
 
+        // Extract severity information
+        let (severity_number, severity_text) = extract_severity(&mut log);
+
         // All remaining fields are treated as attributes.
         let attributes = convert_object_map_to_key_value_vec(
             log.all_event_fields()
@@ -120,8 +125,8 @@ impl OtlpEncoder {
         LogRecord {
             time_unix_nano,
             observed_time_unix_nano,
-            severity_number: 0, // TODO: Add severity mapping
-            severity_text: String::new(),
+            severity_number,
+            severity_text,
             body,
             attributes,
             dropped_attributes_count: 0,
@@ -154,7 +159,7 @@ impl crate::sinks::util::encoding::Encoder<Vec<Event>> for OtlpEncoder {
     fn encode_input(
         &self,
         events: Vec<Event>,
-        _writer: &mut dyn io::Write,
+        writer: &mut dyn io::Write,
     ) -> io::Result<(usize, GroupedCountByteSize)> {
         if events.is_empty() {
             return Ok((0, GroupedCountByteSize::default()));
@@ -173,9 +178,7 @@ impl crate::sinks::util::encoding::Encoder<Vec<Event>> for OtlpEncoder {
         match payload_result {
             Ok(payload) => {
                 let len = payload.len();
-                // The writer is not used directly since we are building a single
-                // Protobuf message for the entire batch. The payload is returned
-                // as part of the HttpRequest.
+                writer.write_all(&payload)?;
                 Ok((len, byte_size))
             }
             Err(()) => {
@@ -189,13 +192,20 @@ impl crate::sinks::util::encoding::Encoder<Vec<Event>> for OtlpEncoder {
 
 // Helper functions for converting Vector `Value`s to OTLP Protobuf types.
 
-fn convert_value_to_any_value(value: Value) -> AnyValue {
+pub(super) fn convert_value_to_any_value(value: Value) -> AnyValue {
     let value = match value {
         Value::Null => return AnyValue { value: None },
         Value::Boolean(b) => PbValue::BoolValue(b),
         Value::Integer(i) => PbValue::IntValue(i),
         Value::Float(f) => PbValue::DoubleValue(f.into()),
-        Value::Bytes(b) => PbValue::BytesValue(b.into()),
+        Value::Bytes(b) => {
+            // Try to convert bytes to UTF-8 string first, fallback to binary if not valid UTF-8
+            if let Ok(s) = String::from_utf8(b.to_vec()) {
+                PbValue::StringValue(s)
+            } else {
+                PbValue::BytesValue(b.into())
+            }
+        }
         Value::Timestamp(ts) => PbValue::StringValue(ts.to_string()),
         Value::Object(map) => PbValue::KvlistValue(convert_object_map_to_key_value_list(map)),
         Value::Array(arr) => {
@@ -237,5 +247,103 @@ fn try_convert_value_to_key_value_vec(value: Value) -> Result<Vec<KeyValue>, ()>
             )
         });
         Err(())
+    }
+}
+
+/// Extract severity number and text from a log event.
+///
+/// This function looks for common severity/level fields and maps them to OTLP severity values.
+/// It removes the severity fields from the log so they don't appear as attributes.
+pub(super) fn extract_severity(log: &mut LogEvent) -> (i32, String) {
+    // Try common field names for severity/level
+    let severity_fields = [
+        "level",
+        "severity",
+        "severity_text",
+        "log_level",
+        "priority",
+    ];
+
+    for field_name in &severity_fields {
+        if let Some(severity_value) = log.remove(*field_name) {
+            return map_severity_to_otlp(severity_value);
+        }
+    }
+
+    // Default to unspecified if no severity field found
+    (SeverityNumber::Unspecified as i32, String::new())
+}
+
+/// Map a Vector Value to OTLP severity number and text.
+pub(super) fn map_severity_to_otlp(value: Value) -> (i32, String) {
+    let severity_str = match &value {
+        Value::Bytes(b) => String::from_utf8_lossy(b).to_lowercase(),
+        Value::Integer(i) => {
+            // Handle numeric severity levels (0-7 syslog style or direct OTLP numbers)
+            return map_numeric_severity(*i);
+        }
+        other => other.to_string_lossy().to_lowercase(),
+    };
+
+    let severity_text = severity_str.to_uppercase();
+
+    let severity_number = match severity_str.as_str() {
+        // TRACE levels
+        "trace" | "finest" => SeverityNumber::Trace,
+        "trace1" | "trace2" | "trace3" | "trace4" => SeverityNumber::Trace4,
+
+        // DEBUG levels
+        "debug" | "fine" => SeverityNumber::Debug,
+        "debug1" | "debug2" | "debug3" | "debug4" => SeverityNumber::Debug4,
+
+        // INFO levels
+        "info" | "information" | "notice" => SeverityNumber::Info,
+        "info1" | "info2" | "info3" | "info4" => SeverityNumber::Info4,
+
+        // WARN levels
+        "warn" | "warning" => SeverityNumber::Warn,
+        "warn1" | "warn2" | "warn3" | "warn4" => SeverityNumber::Warn4,
+
+        // ERROR levels
+        "error" | "err" => SeverityNumber::Error,
+        "error1" | "error2" | "error3" | "error4" => SeverityNumber::Error4,
+
+        // FATAL levels
+        "fatal" | "critical" | "crit" | "emergency" | "emerg" | "panic" => SeverityNumber::Fatal,
+        "fatal1" | "fatal2" | "fatal3" | "fatal4" => SeverityNumber::Fatal4,
+
+        // Default to unspecified for unknown levels
+        _ => SeverityNumber::Unspecified,
+    };
+
+    (severity_number as i32, severity_text)
+}
+
+/// Map numeric severity values to OTLP severity.
+/// Handles both syslog-style (0-7) and direct OTLP numbering (1-24).
+fn map_numeric_severity(level: i64) -> (i32, String) {
+    match level {
+        // Syslog style (RFC 5424) - prioritize these first
+        0 => (SeverityNumber::Fatal as i32, "EMERGENCY".to_string()),
+        1 => (SeverityNumber::Fatal as i32, "ALERT".to_string()),
+        2 => (SeverityNumber::Fatal as i32, "CRITICAL".to_string()),
+        3 => (SeverityNumber::Error as i32, "ERROR".to_string()),
+        4 => (SeverityNumber::Warn as i32, "WARNING".to_string()),
+        5 => (SeverityNumber::Info as i32, "NOTICE".to_string()),
+        6 => (SeverityNumber::Info as i32, "INFO".to_string()),
+        7 => (SeverityNumber::Debug as i32, "DEBUG".to_string()),
+
+        // Direct OTLP numeric levels (8+ to avoid syslog overlap)
+        8 => (level as i32, "DEBUG".to_string()),
+        9..=12 => (level as i32, "INFO".to_string()),
+        13..=16 => (level as i32, "WARN".to_string()),
+        17..=20 => (level as i32, "ERROR".to_string()),
+        21..=24 => (level as i32, "FATAL".to_string()),
+
+        // Out of range - default to unspecified
+        _ => (
+            SeverityNumber::Unspecified as i32,
+            format!("LEVEL_{}", level),
+        ),
     }
 }
