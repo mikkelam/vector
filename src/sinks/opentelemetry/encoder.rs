@@ -60,17 +60,22 @@ impl OtlpEncoder {
         for event in events {
             let mut log = event.into_log();
 
-            // Extract resource attributes from the first event only
+            // Extract resource attributes from both nested and flattened formats
             if event_resource_attributes.is_empty() {
+                // First try nested format (for existing tests)
                 if let Some(resource_map) = log.remove(event_path!("resource")) {
                     if let Some(resource_obj) = resource_map.as_object() {
                         event_resource_attributes =
                             convert_object_map_to_key_value_vec(resource_obj.clone());
                     }
                 }
+                // Then extract any flattened fields (for Vector OTLP source)
+                let flattened_attrs = self.extract_resource_attributes(&mut log);
+                event_resource_attributes.extend(flattened_attrs);
             } else {
                 // Remove resource attributes from subsequent events to avoid duplication
                 let _ = log.remove(event_path!("resource"));
+                self.remove_resource_attributes(&mut log);
             }
 
             let log_record = self.convert_log_event_to_log_record(log);
@@ -177,13 +182,8 @@ impl OtlpEncoder {
         // Extract severity information
         let (severity_number, severity_text) = extract_severity(&mut log);
 
-        // All remaining fields are treated as attributes.
-        let attributes = convert_object_map_to_key_value_vec(
-            log.all_event_fields()
-                .unwrap()
-                .map(|(k, v)| (k.clone(), v.clone()))
-                .collect(),
-        );
+        // Extract attributes from flattened fields (attributes.*) and remaining fields
+        let attributes = self.extract_log_attributes(&mut log);
 
         LogRecord {
             time_unix_nano,
@@ -325,6 +325,115 @@ impl OtlpEncoder {
 
         merged_attributes
     }
+
+    /// Extracts resource attributes from flattened fields with "resources." prefix.
+    fn extract_resource_attributes(&self, log: &mut LogEvent) -> Vec<KeyValue> {
+        let mut resource_attributes = Vec::new();
+        let mut keys_to_remove = Vec::new();
+
+        // Collect all fields that start with "resources."
+        for (key, value) in log.all_event_fields().unwrap() {
+            if let Some(attr_key) = key.strip_prefix("resources.") {
+                // Remove surrounding quotes if present
+                let clean_key = attr_key.trim_matches('"');
+                resource_attributes.push(KeyValue {
+                    key: clean_key.to_string(),
+                    value: Some(convert_value_to_any_value(value.clone())),
+                });
+                keys_to_remove.push(key.clone());
+            }
+        }
+
+        // Remove the flattened resource fields from the log
+        for key in &keys_to_remove {
+            log.remove(key.as_str());
+        }
+
+        // Clean up empty parent objects that may have been left behind
+        if log
+            .get("resources")
+            .and_then(|v| v.as_object())
+            .map_or(false, |obj| obj.is_empty())
+        {
+            log.remove("resources");
+        }
+
+        resource_attributes
+    }
+
+    /// Removes resource attributes from log event (for subsequent events in batch).
+    fn remove_resource_attributes(&self, log: &mut LogEvent) {
+        let mut keys_to_remove = Vec::new();
+
+        for (key, _) in log.all_event_fields().unwrap() {
+            if key.starts_with("resources.") {
+                keys_to_remove.push(key.clone());
+            }
+        }
+
+        for key in keys_to_remove {
+            log.remove(key.as_str());
+        }
+    }
+
+    /// Extracts log record attributes from flattened fields and remaining fields.
+    fn extract_log_attributes(&self, log: &mut LogEvent) -> Vec<KeyValue> {
+        let mut attributes = Vec::new();
+        let mut keys_to_remove = Vec::new();
+
+        // First, extract flattened attribute fields with "attributes." prefix
+        for (key, value) in log.all_event_fields().unwrap() {
+            if let Some(attr_key) = key.strip_prefix("attributes.") {
+                // Remove surrounding quotes if present
+                let clean_key = attr_key.trim_matches('"');
+                attributes.push(KeyValue {
+                    key: clean_key.to_string(),
+                    value: Some(convert_value_to_any_value(value.clone())),
+                });
+                keys_to_remove.push(key.clone());
+            }
+        }
+
+        // Remove the flattened attribute fields
+        for key in &keys_to_remove {
+            log.remove(key.as_str());
+        }
+
+        // Clean up empty parent objects that may have been left behind
+        if log
+            .get("attributes")
+            .and_then(|v| v.as_object())
+            .map_or(false, |obj| obj.is_empty())
+        {
+            log.remove("attributes");
+        }
+
+        // Add remaining fields as attributes (excluding core OTLP fields that have dedicated protobuf fields)
+        let remaining_fields: ObjectMap = log
+            .all_event_fields()
+            .unwrap()
+            .filter(|(key, _)| {
+                !matches!(
+                    key.as_str(),
+                    "severity_number"
+                        | "severity_text"
+                        | "trace_id"
+                        | "span_id"
+                        | "observed_timestamp"
+                        | "source_type"
+                        | "flags"
+                        | "dropped_attributes_count"
+                        | "attributes"
+                        | "resources"
+                ) && !key.starts_with("resources.")
+                    && !key.starts_with("attributes.")
+            })
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+
+        attributes.extend(convert_object_map_to_key_value_vec(remaining_fields));
+        attributes
+    }
 }
 
 impl crate::sinks::util::encoding::Encoder<Vec<Event>> for OtlpEncoder {
@@ -421,8 +530,17 @@ pub(super) fn extract_severity(log: &mut LogEvent) -> (i32, String) {
     ];
 
     for field_name in &severity_fields {
-        if let Some(severity_value) = log.remove(*field_name) {
-            return map_severity_to_otlp(severity_value);
+        if let Some(severity_value) = log.get(*field_name) {
+            let result = map_severity_to_otlp(severity_value.clone());
+
+            // Clean up severity fields: keep "level" as attribute, remove others
+            for cleanup_field in &severity_fields {
+                if *cleanup_field != "level" {
+                    log.remove(*cleanup_field);
+                }
+            }
+
+            return result;
         }
     }
 
@@ -444,29 +562,47 @@ pub(super) fn map_severity_to_otlp(value: Value) -> (i32, String) {
     let severity_text = severity_str.to_uppercase();
 
     let severity_number = match severity_str.as_str() {
-        // TRACE levels
+        // TRACE levels (1-4)
         "trace" | "finest" => SeverityNumber::Trace,
-        "trace1" | "trace2" | "trace3" | "trace4" => SeverityNumber::Trace4,
+        "trace1" => SeverityNumber::Trace,
+        "trace2" => SeverityNumber::Trace2,
+        "trace3" => SeverityNumber::Trace3,
+        "trace4" => SeverityNumber::Trace4,
 
-        // DEBUG levels
+        // DEBUG levels (5-8)
         "debug" | "fine" => SeverityNumber::Debug,
-        "debug1" | "debug2" | "debug3" | "debug4" => SeverityNumber::Debug4,
+        "debug1" => SeverityNumber::Debug,
+        "debug2" => SeverityNumber::Debug2,
+        "debug3" => SeverityNumber::Debug3,
+        "debug4" => SeverityNumber::Debug4,
 
-        // INFO levels
+        // INFO levels (9-12)
         "info" | "information" | "notice" => SeverityNumber::Info,
-        "info1" | "info2" | "info3" | "info4" => SeverityNumber::Info4,
+        "info1" => SeverityNumber::Info,
+        "info2" => SeverityNumber::Info2,
+        "info3" => SeverityNumber::Info3,
+        "info4" => SeverityNumber::Info4,
 
-        // WARN levels
+        // WARN levels (13-16)
         "warn" | "warning" => SeverityNumber::Warn,
-        "warn1" | "warn2" | "warn3" | "warn4" => SeverityNumber::Warn4,
+        "warn1" => SeverityNumber::Warn,
+        "warn2" => SeverityNumber::Warn2,
+        "warn3" => SeverityNumber::Warn3,
+        "warn4" => SeverityNumber::Warn4,
 
-        // ERROR levels
+        // ERROR levels (17-20)
         "error" | "err" => SeverityNumber::Error,
-        "error1" | "error2" | "error3" | "error4" => SeverityNumber::Error4,
+        "error1" => SeverityNumber::Error,
+        "error2" => SeverityNumber::Error2,
+        "error3" => SeverityNumber::Error3,
+        "error4" => SeverityNumber::Error4,
 
-        // FATAL levels
+        // FATAL levels (21-24)
         "fatal" | "critical" | "crit" | "emergency" | "emerg" | "panic" => SeverityNumber::Fatal,
-        "fatal1" | "fatal2" | "fatal3" | "fatal4" => SeverityNumber::Fatal4,
+        "fatal1" => SeverityNumber::Fatal,
+        "fatal2" => SeverityNumber::Fatal2,
+        "fatal3" => SeverityNumber::Fatal3,
+        "fatal4" => SeverityNumber::Fatal4,
 
         // Default to unspecified for unknown levels
         _ => SeverityNumber::Unspecified,
@@ -479,7 +615,7 @@ pub(super) fn map_severity_to_otlp(value: Value) -> (i32, String) {
 /// Handles both syslog-style (0-7) and direct OTLP numbering (1-24).
 fn map_numeric_severity(level: i64) -> (i32, String) {
     match level {
-        // Syslog style (RFC 5424) - prioritize these first
+        // Syslog style (RFC 5424) - prioritize these first since they're 0-7
         0 => (SeverityNumber::Fatal as i32, "EMERGENCY".to_string()),
         1 => (SeverityNumber::Fatal as i32, "ALERT".to_string()),
         2 => (SeverityNumber::Fatal as i32, "CRITICAL".to_string()),
@@ -489,7 +625,7 @@ fn map_numeric_severity(level: i64) -> (i32, String) {
         6 => (SeverityNumber::Info as i32, "INFO".to_string()),
         7 => (SeverityNumber::Debug as i32, "DEBUG".to_string()),
 
-        // Direct OTLP numeric levels (8+ to avoid syslog overlap)
+        // Direct OTLP numeric levels (8-24, avoiding syslog overlap)
         8 => (level as i32, "DEBUG".to_string()),
         9..=12 => (level as i32, "INFO".to_string()),
         13..=16 => (level as i32, "WARN".to_string()),
@@ -952,5 +1088,190 @@ mod tests {
             hex::decode("4ac52aadf321c2e531db005df08792f5").unwrap()
         );
         assert_eq!(log_record.span_id, hex::decode("0b9e4bda2a55530d").unwrap());
+    }
+
+    #[test]
+    fn test_flattened_otlp_structure() {
+        let encoder = OtlpEncoder::new(OtlpConfig::default());
+
+        // Create log event with flattened OTLP structure as Vector's source provides
+        let mut log = LogEvent::from("Processing DELETE /api/orders/789");
+
+        // Resource attributes (flattened with resources. prefix)
+        log.insert("resources.\"deployment.environment\"", "test");
+        log.insert("resources.\"host.name\"", "test-host");
+        log.insert("resources.\"service.name\"", "otel-test-generator");
+        log.insert("resources.\"service.version\"", "1.0.0");
+
+        // Log record attributes (flattened with attributes. prefix)
+        log.insert(
+            "attributes.\"code.file.path\"",
+            "/home/user/generate_otel_signals.py",
+        );
+        log.insert(
+            "attributes.\"code.function.name\"",
+            "generate_request_trace",
+        );
+        log.insert("attributes.\"http.method\"", "DELETE");
+        log.insert("attributes.\"request.id\"", "req_497271");
+
+        // Other log fields
+        log.insert("severity_number", 9);
+        log.insert("level", "INFO");
+
+        let events = vec![Event::Log(log)];
+        let result = encoder.encode_logs(events).unwrap();
+
+        // Decode the protobuf to verify structure
+        use prost::Message;
+        use vector_lib::opentelemetry::proto::collector::logs::v1::ExportLogsServiceRequest;
+
+        let request = ExportLogsServiceRequest::decode(result.as_ref()).unwrap();
+        let resource_logs = &request.resource_logs[0];
+        let resource = resource_logs.resource.as_ref().unwrap();
+        let log_record = &resource_logs.scope_logs[0].log_records[0];
+
+        // Verify resource attributes are properly extracted and structured
+        let resource_attrs: std::collections::HashMap<String, String> = resource
+            .attributes
+            .iter()
+            .map(|kv| {
+                let value = kv.value.as_ref().unwrap().value.as_ref().unwrap();
+                if let vector_lib::opentelemetry::proto::common::v1::any_value::Value::StringValue(
+                    s,
+                ) = value
+                {
+                    (kv.key.clone(), s.clone())
+                } else {
+                    (kv.key.clone(), "".to_string())
+                }
+            })
+            .collect();
+
+        assert_eq!(
+            resource_attrs.get("deployment.environment"),
+            Some(&"test".to_string())
+        );
+        assert_eq!(
+            resource_attrs.get("service.name"),
+            Some(&"otel-test-generator".to_string())
+        );
+        assert_eq!(
+            resource_attrs.get("host.name"),
+            Some(&"test-host".to_string())
+        );
+
+        // Verify log record attributes are properly extracted
+        let log_attrs: std::collections::HashMap<String, String> = log_record
+            .attributes
+            .iter()
+            .map(|kv| {
+                let value = kv.value.as_ref().unwrap().value.as_ref().unwrap();
+                if let vector_lib::opentelemetry::proto::common::v1::any_value::Value::StringValue(
+                    s,
+                ) = value
+                {
+                    (kv.key.clone(), s.clone())
+                } else {
+                    (kv.key.clone(), "".to_string())
+                }
+            })
+            .collect();
+
+        assert_eq!(
+            log_attrs.get("code.file.path"),
+            Some(&"/home/user/generate_otel_signals.py".to_string())
+        );
+        assert_eq!(log_attrs.get("http.method"), Some(&"DELETE".to_string()));
+        assert_eq!(log_attrs.get("request.id"), Some(&"req_497271".to_string()));
+
+        // Verify other fields are preserved as log attributes (not flattened with prefixes)
+        assert_eq!(log_attrs.get("level"), Some(&"INFO".to_string()));
+
+        // Verify severity is properly extracted (not in attributes)
+        assert_eq!(log_record.severity_number, 9);
+        assert!(!log_attrs.contains_key("severity_number"));
+    }
+
+    #[test]
+    fn test_quoted_vs_unquoted_attribute_keys() {
+        let encoder = OtlpEncoder::new(OtlpConfig::default());
+
+        // Test with quoted keys (as seen from Vector's OTLP source)
+        let mut log1 = LogEvent::from("test message 1");
+        log1.insert("attributes.\"code.file.path\"", "/path/to/file.py");
+        log1.insert("resources.\"service.name\"", "test-service");
+
+        // Test with unquoted keys (edge case)
+        let mut log2 = LogEvent::from("test message 2");
+        log2.insert("attributes.simple_key", "simple_value");
+        log2.insert("resources.service_name", "test-service-2");
+
+        let events = vec![Event::Log(log1), Event::Log(log2)];
+        let result = encoder.encode_logs(events).unwrap();
+
+        use prost::Message;
+        use vector_lib::opentelemetry::proto::collector::logs::v1::ExportLogsServiceRequest;
+
+        let request = ExportLogsServiceRequest::decode(result.as_ref()).unwrap();
+        let resource_logs = &request.resource_logs[0];
+        let resource = resource_logs.resource.as_ref().unwrap();
+        let log_records = &resource_logs.scope_logs[0].log_records;
+
+        // Check resource attributes (should handle both quoted and unquoted)
+        let resource_attrs: std::collections::HashMap<String, String> = resource
+            .attributes
+            .iter()
+            .map(|kv| {
+                let value = kv.value.as_ref().unwrap().value.as_ref().unwrap();
+                if let vector_lib::opentelemetry::proto::common::v1::any_value::Value::StringValue(
+                    s,
+                ) = value
+                {
+                    (kv.key.clone(), s.clone())
+                } else {
+                    (kv.key.clone(), "".to_string())
+                }
+            })
+            .collect();
+
+        // Should have both service names without quotes in the keys
+        assert!(
+            resource_attrs.contains_key("service.name")
+                || resource_attrs.contains_key("service_name")
+        );
+
+        // Check log record attributes
+        for log_record in log_records {
+            let log_attrs: std::collections::HashMap<String, String> = log_record
+                .attributes
+                .iter()
+                .map(|kv| {
+                    let value = kv.value.as_ref().unwrap().value.as_ref().unwrap();
+                    if let vector_lib::opentelemetry::proto::common::v1::any_value::Value::StringValue(
+                        s,
+                    ) = value
+                    {
+                        (kv.key.clone(), s.clone())
+                    } else {
+                        (kv.key.clone(), "".to_string())
+                    }
+                })
+                .collect();
+
+            // Should have attribute keys without quotes
+            if log_attrs.contains_key("code.file.path") {
+                assert_eq!(
+                    log_attrs.get("code.file.path"),
+                    Some(&"/path/to/file.py".to_string())
+                );
+            }
+            if log_attrs.contains_key("simple_key") {
+                assert_eq!(
+                    log_attrs.get("simple_key"),
+                    Some(&"simple_value".to_string())
+                );
+            }
+        }
     }
 }

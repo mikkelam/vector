@@ -453,12 +453,19 @@ fn test_extract_severity_from_log() {
 
         let (severity_number, severity_text) = extract_severity(&mut log);
 
-        // Verify the field was removed from the log
-        assert!(
-            log.get(field_name).is_none(),
-            "Field '{}' should have been removed",
-            field_name
-        );
+        // Verify severity field handling: "level" is preserved, others are removed
+        if field_name == "level" {
+            assert!(
+                log.get(field_name).is_some(),
+                "Field 'level' should be preserved as an attribute"
+            );
+        } else {
+            assert!(
+                log.get(field_name).is_none(),
+                "Field '{}' should have been removed",
+                field_name
+            );
+        }
 
         // Verify correct mapping
         let expected_number = match level_value {
@@ -500,10 +507,10 @@ fn test_extract_severity_field_priority() {
     assert_eq!(severity_number, 17); // SEVERITY_NUMBER_ERROR
     assert_eq!(severity_text, "ERROR");
 
-    // Only the 'level' field should be removed
-    assert!(log.get("level").is_none());
-    assert!(log.get("severity").is_some());
-    assert!(log.get("log_level").is_some());
+    // "level" should be preserved, other severity fields should be cleaned up
+    assert!(log.get("level").is_some());
+    assert!(log.get("severity").is_none());
+    assert!(log.get("log_level").is_none());
 }
 
 #[test]
@@ -525,14 +532,14 @@ fn test_severity_integration_with_encoder() {
     assert_eq!(log_record.severity_number, 13); // SEVERITY_NUMBER_WARN
     assert_eq!(log_record.severity_text, "WARN");
 
-    // Check that 'level' field was removed from attributes
+    // Check that 'level' field is preserved in attributes
     let level_attr = log_record
         .attributes
         .iter()
         .find(|attr| attr.key == "level");
     assert!(
-        level_attr.is_none(),
-        "Level field should not be in attributes"
+        level_attr.is_some(),
+        "Level field should be preserved in attributes"
     );
 
     // Check that other fields are still present
