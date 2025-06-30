@@ -1233,8 +1233,6 @@ fn test_default_config() {
     assert!(config.otlp.resource_attributes.is_empty());
     assert!(config.otlp.service_name.is_none());
     assert!(config.otlp.service_version.is_none());
-    assert_eq!(config.otlp.max_export_batch_size, 512);
-    assert_eq!(config.otlp.export_timeout_secs, 30);
 }
 
 #[test]
@@ -1250,8 +1248,6 @@ encoding = "protobuf"
 [otlp]
 service_name = "test-service"
 service_version = "1.0.0"
-max_export_batch_size = 1000
-export_timeout_secs = 60
 
 [otlp.resource_attributes]
 "deployment.environment" = "staging"
@@ -1266,8 +1262,6 @@ export_timeout_secs = 60
 
     assert_eq!(config.otlp.service_name, Some("test-service".to_string()));
     assert_eq!(config.otlp.service_version, Some("1.0.0".to_string()));
-    assert_eq!(config.otlp.max_export_batch_size, 1000);
-    assert_eq!(config.otlp.export_timeout_secs, 60);
 
     assert_eq!(
         config
@@ -1463,8 +1457,7 @@ encoding = "protobuf"
 [otlp]
 service_name = "user-service"
 service_version = "2.4.1"
-max_export_batch_size = 1024
-export_timeout_secs = 30
+
 
 [otlp.resource_attributes]
 "service.name" = "user-service"
@@ -1493,8 +1486,6 @@ export_timeout_secs = 30
     // Verify OTLP config
     assert_eq!(config.otlp.service_name, Some("user-service".to_string()));
     assert_eq!(config.otlp.service_version, Some("2.4.1".to_string()));
-    assert_eq!(config.otlp.max_export_batch_size, 1024);
-    assert_eq!(config.otlp.export_timeout_secs, 30);
 
     // Verify resource attributes
     assert_eq!(

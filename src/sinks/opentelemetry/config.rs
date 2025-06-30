@@ -38,14 +38,6 @@ fn default_traces_path() -> String {
     DEFAULT_TRACES_PATH.to_string()
 }
 
-fn default_max_export_batch_size() -> usize {
-    512
-}
-
-fn default_export_timeout_secs() -> u64 {
-    30
-}
-
 /// HTTP method to use for OTLP requests.
 #[configurable_component]
 #[derive(Clone, Copy, Debug, Default)]
@@ -186,20 +178,6 @@ pub struct OtlpConfig {
     /// If not specified, the service version from individual events or a default will be used.
     #[configurable(metadata(docs::examples = "1.0.0"))]
     pub service_version: Option<String>,
-
-    /// Maximum number of items to include in a single export batch.
-    ///
-    /// Larger batches can improve throughput but may increase memory usage and latency.
-    #[serde(default = "default_max_export_batch_size")]
-    #[configurable(metadata(docs::type_unit = "events"))]
-    pub max_export_batch_size: usize,
-
-    /// Maximum time to wait for a batch to be exported.
-    ///
-    /// This timeout applies to the HTTP request itself, not the batching process.
-    #[serde(default = "default_export_timeout_secs")]
-    #[configurable(metadata(docs::type_unit = "seconds"))]
-    pub export_timeout_secs: u64,
 }
 
 impl Default for OtlpConfig {
@@ -208,9 +186,63 @@ impl Default for OtlpConfig {
             resource_attributes: IndexMap::new(),
             service_name: None,
             service_version: None,
-            max_export_batch_size: default_max_export_batch_size(),
-            export_timeout_secs: default_export_timeout_secs(),
         }
+    }
+}
+
+impl OtlpConfig {
+    /// Validates the configuration for conflicts between specific service configs and resource attributes.
+    ///
+    /// # Examples
+    ///
+    /// Valid configurations:
+    /// ```toml
+    /// # Using specific service config only
+    /// [sinks.otlp.otlp]
+    /// service_name = "my-service"
+    /// service_version = "1.0.0"
+    ///
+    /// # Using resource attributes only
+    /// [sinks.otlp.otlp.resource_attributes]
+    /// "service.name" = "my-service"
+    /// "service.version" = "1.0.0"
+    /// "deployment.env" = "production"
+    ///
+    /// # Mixed (non-conflicting)
+    /// [sinks.otlp.otlp]
+    /// service_name = "my-service"
+    /// [sinks.otlp.otlp.resource_attributes]
+    /// "deployment.env" = "production"
+    /// ```
+    ///
+    /// Invalid configurations (will return error):
+    /// ```toml
+    /// # Conflict: both service_name and resource_attributes.service.name
+    /// [sinks.otlp.otlp]
+    /// service_name = "my-service"
+    /// [sinks.otlp.otlp.resource_attributes]
+    /// "service.name" = "conflicting-name"  # ERROR!
+    /// ```
+    pub fn validate(&self) -> crate::Result<()> {
+        if self.service_name.is_some() && self.resource_attributes.contains_key("service.name") {
+            return Err(format!(
+                "Configuration conflict: both 'service_name' and 'resource_attributes.service.name' are set. \
+                Use either 'service_name' for the specific service name OR include 'service.name' in \
+                'resource_attributes', but not both."
+            ).into());
+        }
+
+        if self.service_version.is_some()
+            && self.resource_attributes.contains_key("service.version")
+        {
+            return Err(format!(
+                "Configuration conflict: both 'service_version' and 'resource_attributes.service.version' are set. \
+                Use either 'service_version' for the specific service version OR include 'service.version' in \
+                'resource_attributes', but not both."
+            ).into());
+        }
+
+        Ok(())
     }
 }
 
@@ -361,6 +393,9 @@ impl_generate_config_from_default!(OpenTelemetryConfig);
 #[typetag::serde(name = "opentelemetry")]
 impl SinkConfig for OpenTelemetryConfig {
     async fn build(&self, cx: SinkContext) -> crate::Result<(VectorSink, Healthcheck)> {
+        // Validate OTLP configuration for conflicts
+        self.otlp.validate()?;
+
         let batch_settings = self.batch.validate()?.into_batcher_settings()?;
         let request_settings = self.request.tower.into_settings();
 
@@ -530,5 +565,153 @@ mod tests {
         assert_eq!(config.endpoint, "http://localhost:4318");
         assert_eq!(config.healthcheck.path, "/status");
         assert!(!config.healthcheck.skip);
+    }
+
+    #[test]
+    fn test_otlp_config_validation_service_name_conflict() {
+        let mut config = OtlpConfig::default();
+        config.service_name = Some("my-service".to_string());
+        config.resource_attributes.insert(
+            "service.name".to_string(),
+            "conflicting-service".to_string(),
+        );
+
+        let result = config.validate();
+        assert!(result.is_err());
+        let error_msg = result.unwrap_err().to_string();
+        assert!(error_msg.contains("Configuration conflict"));
+        assert!(error_msg.contains("service_name"));
+        assert!(error_msg.contains("resource_attributes.service.name"));
+    }
+
+    #[test]
+    fn test_otlp_config_validation_service_version_conflict() {
+        let mut config = OtlpConfig::default();
+        config.service_version = Some("1.0.0".to_string());
+        config
+            .resource_attributes
+            .insert("service.version".to_string(), "2.0.0".to_string());
+
+        let result = config.validate();
+        assert!(result.is_err());
+        let error_msg = result.unwrap_err().to_string();
+        assert!(error_msg.contains("Configuration conflict"));
+        assert!(error_msg.contains("service_version"));
+        assert!(error_msg.contains("resource_attributes.service.version"));
+    }
+
+    #[test]
+    fn test_otlp_config_validation_no_conflict() {
+        let mut config = OtlpConfig::default();
+
+        // Test 1: Only service_name set
+        config.service_name = Some("my-service".to_string());
+        config
+            .resource_attributes
+            .insert("deployment.env".to_string(), "prod".to_string());
+        assert!(config.validate().is_ok());
+
+        // Test 2: Only resource_attributes service.name set
+        let mut config2 = OtlpConfig::default();
+        config2
+            .resource_attributes
+            .insert("service.name".to_string(), "my-service".to_string());
+        assert!(config2.validate().is_ok());
+
+        // Test 3: Both service configs set with non-conflicting resource attributes
+        let mut config3 = OtlpConfig::default();
+        config3.service_name = Some("my-service".to_string());
+        config3.service_version = Some("1.0.0".to_string());
+        config3
+            .resource_attributes
+            .insert("deployment.env".to_string(), "prod".to_string());
+        config3
+            .resource_attributes
+            .insert("cluster.name".to_string(), "us-west".to_string());
+        assert!(config3.validate().is_ok());
+    }
+
+    #[test]
+    fn test_otlp_config_validation_both_conflicts() {
+        let mut config = OtlpConfig::default();
+        config.service_name = Some("my-service".to_string());
+        config.service_version = Some("1.0.0".to_string());
+        config.resource_attributes.insert(
+            "service.name".to_string(),
+            "conflicting-service".to_string(),
+        );
+        config
+            .resource_attributes
+            .insert("service.version".to_string(), "2.0.0".to_string());
+
+        let result = config.validate();
+        assert!(result.is_err());
+        // Should fail on the first conflict (service.name)
+        let error_msg = result.unwrap_err().to_string();
+        assert!(error_msg.contains("service_name"));
+    }
+
+    #[tokio::test]
+    async fn test_sink_build_validation_failure() {
+        use crate::config::SinkContext;
+        use crate::test_util::components::init_test;
+
+        init_test();
+
+        let mut config = OpenTelemetryConfig::default();
+        config.endpoint = "http://localhost:4318".to_string();
+
+        // Create conflicting configuration
+        config.otlp.service_name = Some("my-service".to_string());
+        config.otlp.resource_attributes.insert(
+            "service.name".to_string(),
+            "conflicting-service".to_string(),
+        );
+
+        let context = SinkContext::default();
+        let result = config.build(context).await;
+
+        match result {
+            Err(error) => {
+                let error_msg = error.to_string();
+                assert!(error_msg.contains("Configuration conflict"));
+                assert!(error_msg.contains("service_name"));
+                assert!(error_msg.contains("resource_attributes.service.name"));
+            }
+            Ok(_) => panic!("Expected validation error but build succeeded"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_sink_build_valid_configuration() {
+        use crate::config::SinkContext;
+        use crate::test_util::components::init_test;
+
+        init_test();
+
+        let mut config = OpenTelemetryConfig::default();
+        config.endpoint = "http://localhost:4318".to_string();
+
+        // Valid configuration - specific service config with non-conflicting resource attributes
+        config.otlp.service_name = Some("my-service".to_string());
+        config.otlp.service_version = Some("1.0.0".to_string());
+        config.otlp.resource_attributes.insert(
+            "deployment.environment".to_string(),
+            "production".to_string(),
+        );
+        config
+            .otlp
+            .resource_attributes
+            .insert("cluster.name".to_string(), "us-west-2".to_string());
+
+        let context = SinkContext::default();
+        let result = config.build(context).await;
+
+        match result {
+            Ok(_) => {
+                // Success - validation passed and sink was built
+            }
+            Err(error) => panic!("Expected successful build but got error: {}", error),
+        }
     }
 }
