@@ -1,22 +1,31 @@
 //! Service implementation for the `opentelemetry` sink.
 
 use bytes::Bytes;
-use http::{header::CONTENT_TYPE, Request, Uri};
+use http::{header::CONTENT_TYPE, Method, Request, Uri};
 
 use crate::{
     http::Auth,
     sinks::{
         prelude::*,
-        util::http::{HttpRequest, HttpServiceRequestBuilder},
+        util::{
+            http::{HttpRequest, HttpServiceRequestBuilder},
+            Compression,
+        },
     },
 };
 
-use super::sink::PartitionKey;
+use super::{
+    config::{ContentEncoding, HttpMethod},
+    sink::PartitionKey,
+};
 
 /// Builds the final `http::Request` for an OTLP batch.
 #[derive(Debug, Clone)]
 pub(super) struct OtlpServiceRequestBuilder {
     pub(super) auth: Option<Auth>,
+    pub(super) method: HttpMethod,
+    pub(super) compression: Compression,
+    pub(super) encoding: ContentEncoding,
 }
 
 impl HttpServiceRequestBuilder<PartitionKey> for OtlpServiceRequestBuilder {
@@ -32,7 +41,27 @@ impl HttpServiceRequestBuilder<PartitionKey> for OtlpServiceRequestBuilder {
             crate::Error::from(format!("Invalid URI: {}", err))
         })?;
 
-        let builder = Request::post(uri).header(CONTENT_TYPE, "application/x-protobuf");
+        // Use the configured HTTP method
+        let http_method: Method = self.method.into();
+        let mut builder = Request::builder().method(http_method).uri(uri);
+
+        // Set content type based on encoding
+        let content_type = match self.encoding {
+            ContentEncoding::Protobuf => "application/x-protobuf",
+        };
+        builder = builder.header(CONTENT_TYPE, content_type);
+
+        // Set compression headers if compression is enabled
+        if !matches!(self.compression, Compression::None) {
+            let encoding = match self.compression {
+                Compression::Gzip(_) => "gzip",
+                Compression::Zlib(_) => "deflate",
+                Compression::Zstd(_) => "zstd",
+                Compression::Snappy => "snappy",
+                Compression::None => unreachable!(),
+            };
+            builder = builder.header("Content-Encoding", encoding);
+        }
 
         let mut http_request = builder
             .body(request.take_payload())

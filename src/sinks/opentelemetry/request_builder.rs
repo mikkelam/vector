@@ -4,21 +4,26 @@ use std::io;
 
 use bytes::Bytes;
 
-use crate::sinks::{prelude::*, util::http::HttpRequest};
+use crate::sinks::{
+    prelude::*,
+    util::{http::HttpRequest, Compression},
+};
 
-use super::{encoder::OtlpEncoder, sink::PartitionKey};
+use super::{config::OtlpConfig, encoder::OtlpEncoder, sink::PartitionKey};
 
 /// Builds `HttpRequest`s for the OTLP sink.
 #[derive(Debug, Clone)]
 pub(super) struct OtlpRequestBuilder {
     encoder: OtlpEncoder,
+    compression: Compression,
 }
 
 impl OtlpRequestBuilder {
     /// Creates a new `OtlpRequestBuilder`.
-    pub(super) const fn new() -> Self {
+    pub(super) fn new(compression: Compression, otlp_config: OtlpConfig) -> Self {
         Self {
-            encoder: OtlpEncoder::new(),
+            encoder: OtlpEncoder::new(otlp_config),
+            compression,
         }
     }
 }
@@ -32,10 +37,7 @@ impl RequestBuilder<(PartitionKey, Vec<Event>)> for OtlpRequestBuilder {
     type Error = io::Error;
 
     fn compression(&self) -> Compression {
-        // OTLP/HTTP has its own compression negotiation via the `Content-Encoding`
-        // header, which is handled by the HTTP client. We don't need to compress
-        // the payload at this stage.
-        Compression::None
+        self.compression
     }
 
     fn encoder(&self) -> &Self::Encoder {

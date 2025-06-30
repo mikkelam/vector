@@ -4,12 +4,13 @@ use chrono::{TimeZone, Utc};
 use futures::stream;
 use http::{Request, Response};
 use hyper::Body;
+use indexmap::IndexMap;
 use prost::Message;
 use rstest::rstest;
 use std::convert::Infallible;
 use std::sync::{Arc, Mutex};
 
-use super::config::OtlpProtocol;
+use super::config::{ContentEncoding, HttpMethod, OtlpConfig, OtlpProtocol};
 use vector_lib::event::EventMetadata;
 use vrl::event_path;
 
@@ -19,7 +20,7 @@ use crate::{
     sinks::{
         opentelemetry::{config::OpenTelemetryConfig, encoder::OtlpEncoder, sink::KeyPartitioner},
         prelude::*,
-        util::encoding::Encoder,
+        util::{encoding::Encoder, Compression},
     },
     test_util::{
         components::{run_and_assert_sink_compliance, SINK_TAGS},
@@ -286,7 +287,7 @@ endpoint = "{}"
 
 #[test]
 fn test_encoder_resource_extraction() {
-    let encoder = OtlpEncoder;
+    let encoder = OtlpEncoder::new(Default::default());
 
     let mut log = LogEvent::from("test message");
     log.insert("host", "example.com");
@@ -319,7 +320,7 @@ fn test_encoder_resource_extraction() {
 
 #[test]
 fn test_encode_logs_method_directly() {
-    let encoder = OtlpEncoder::new();
+    let encoder = OtlpEncoder::new(Default::default());
 
     let mut log = LogEvent::from("direct test message");
     log.insert("test_key", "test_value");
@@ -507,7 +508,7 @@ fn test_extract_severity_field_priority() {
 
 #[test]
 fn test_severity_integration_with_encoder() {
-    let encoder = OtlpEncoder::new();
+    let encoder = OtlpEncoder::new(Default::default());
 
     let mut log = LogEvent::from("test message with severity");
     log.insert("level", "warn");
@@ -592,7 +593,7 @@ fn test_string_encoding_utf8_vs_bytes() {
 
 #[test]
 fn test_encoder_string_attributes() {
-    let encoder = OtlpEncoder::new();
+    let encoder = OtlpEncoder::new(Default::default());
 
     let mut log = LogEvent::from("test message");
     // Insert string that will be stored as Bytes internally
@@ -658,7 +659,7 @@ fn test_encode_metrics_counter() {
     use crate::event::{Metric, MetricKind, MetricValue};
     use vector_lib::opentelemetry::proto::collector::metrics::v1::ExportMetricsServiceRequest;
 
-    let encoder = OtlpEncoder::new();
+    let encoder = OtlpEncoder::new(Default::default());
 
     let metric = Metric::new(
         "test_counter",
@@ -736,7 +737,7 @@ fn test_encode_metrics_gauge() {
     use crate::event::{Metric, MetricKind, MetricValue};
     use vector_lib::opentelemetry::proto::collector::metrics::v1::ExportMetricsServiceRequest;
 
-    let encoder = OtlpEncoder::new();
+    let encoder = OtlpEncoder::new(Default::default());
 
     let metric = Metric::new(
         "test_gauge",
@@ -780,7 +781,7 @@ fn test_encode_metrics_histogram() {
     use crate::event::{Metric, MetricKind, MetricValue};
     use vector_lib::opentelemetry::proto::collector::metrics::v1::ExportMetricsServiceRequest;
 
-    let encoder = OtlpEncoder::new();
+    let encoder = OtlpEncoder::new(Default::default());
 
     let buckets = vec![
         Bucket {
@@ -856,7 +857,7 @@ fn test_metrics_partitioner() {
 
 #[test]
 fn test_encoder_routes_metrics_vs_logs() {
-    let encoder = OtlpEncoder::new();
+    let encoder = OtlpEncoder::new(Default::default());
     let mut writer = Vec::new();
 
     // Test that a metric event gets routed to metrics encoding
@@ -917,7 +918,7 @@ fn test_encoder_routes_metrics_vs_logs() {
 fn test_encode_traces_basic() {
     use vector_lib::opentelemetry::proto::collector::trace::v1::ExportTraceServiceRequest;
 
-    let encoder = OtlpEncoder::new();
+    let encoder = OtlpEncoder::new(Default::default());
     let trace_event = create_test_trace_event();
 
     let events = vec![trace_event];
@@ -950,7 +951,7 @@ fn test_encode_traces_with_attributes() {
     use std::collections::BTreeMap;
     use vrl::value::Value;
 
-    let encoder = OtlpEncoder::new();
+    let encoder = OtlpEncoder::new(Default::default());
 
     // Create trace with attributes
     let mut trace_fields = BTreeMap::new();
@@ -1012,7 +1013,7 @@ fn test_encode_traces_with_events() {
     use std::collections::BTreeMap;
     use vrl::value::Value;
 
-    let encoder = OtlpEncoder::new();
+    let encoder = OtlpEncoder::new(Default::default());
 
     // Create trace with span events
     let mut trace_fields = BTreeMap::new();
@@ -1211,4 +1212,321 @@ traces_path = "//custom/traces"
 #[test]
 fn test_generate_config() {
     crate::test_util::test_generate_config::<OpenTelemetryConfig>();
+}
+
+#[test]
+fn test_default_config() {
+    let config = OpenTelemetryConfig::default();
+
+    assert_eq!(config.endpoint, "http://localhost:4318");
+    assert_eq!(config.logs_path, "/v1/logs");
+    assert_eq!(config.metrics_path, "/v1/metrics");
+    assert_eq!(config.traces_path, "/v1/traces");
+    assert!(matches!(config.protocol, OtlpProtocol::Http));
+
+    // Test HTTP config defaults
+    assert!(matches!(config.http.method, HttpMethod::Post));
+    assert!(matches!(config.http.compression, Compression::None));
+    assert!(matches!(config.http.encoding, ContentEncoding::Protobuf));
+
+    // Test OTLP config defaults
+    assert!(config.otlp.resource_attributes.is_empty());
+    assert!(config.otlp.service_name.is_none());
+    assert!(config.otlp.service_version.is_none());
+    assert_eq!(config.otlp.max_export_batch_size, 512);
+    assert_eq!(config.otlp.export_timeout_secs, 30);
+}
+
+#[test]
+fn test_http_config_serialization() {
+    let config_str = r#"
+endpoint = "http://localhost:4318"
+
+[http]
+method = "put"
+compression = "gzip"
+encoding = "protobuf"
+
+[otlp]
+service_name = "test-service"
+service_version = "1.0.0"
+max_export_batch_size = 1000
+export_timeout_secs = 60
+
+[otlp.resource_attributes]
+"deployment.environment" = "staging"
+"service.namespace" = "test"
+"#;
+
+    let config: OpenTelemetryConfig = toml::from_str(config_str).unwrap();
+
+    assert!(matches!(config.http.method, HttpMethod::Put));
+    assert!(matches!(config.http.compression, Compression::Gzip(_)));
+    assert!(matches!(config.http.encoding, ContentEncoding::Protobuf));
+
+    assert_eq!(config.otlp.service_name, Some("test-service".to_string()));
+    assert_eq!(config.otlp.service_version, Some("1.0.0".to_string()));
+    assert_eq!(config.otlp.max_export_batch_size, 1000);
+    assert_eq!(config.otlp.export_timeout_secs, 60);
+
+    assert_eq!(
+        config
+            .otlp
+            .resource_attributes
+            .get("deployment.environment"),
+        Some(&"staging".to_string())
+    );
+    assert_eq!(
+        config.otlp.resource_attributes.get("service.namespace"),
+        Some(&"test".to_string())
+    );
+}
+
+#[test]
+fn test_resource_attributes_config() {
+    let config_str = r#"
+endpoint = "http://localhost:4318"
+
+[otlp.resource_attributes]
+"service.name" = "my-app"
+"service.version" = "2.1.0"
+"deployment.environment" = "production"
+"k8s.cluster.name" = "prod-cluster"
+"k8s.namespace.name" = "monitoring"
+"#;
+
+    let config: OpenTelemetryConfig = toml::from_str(config_str).unwrap();
+
+    let expected_attrs: IndexMap<String, String> = [
+        ("service.name".to_string(), "my-app".to_string()),
+        ("service.version".to_string(), "2.1.0".to_string()),
+        (
+            "deployment.environment".to_string(),
+            "production".to_string(),
+        ),
+        ("k8s.cluster.name".to_string(), "prod-cluster".to_string()),
+        ("k8s.namespace.name".to_string(), "monitoring".to_string()),
+    ]
+    .into_iter()
+    .collect();
+
+    assert_eq!(config.otlp.resource_attributes, expected_attrs);
+}
+
+#[test]
+fn test_compression_options() {
+    let configs = [
+        (
+            r#"[http]
+compression = "none""#,
+            "None",
+        ),
+        (
+            r#"[http]
+compression = "gzip""#,
+            "Gzip",
+        ),
+        (
+            r#"[http]
+compression = "zlib""#,
+            "Zlib",
+        ),
+        (
+            r#"[http]
+compression = "zstd""#,
+            "Zstd",
+        ),
+        (
+            r#"[http]
+compression = "snappy""#,
+            "Snappy",
+        ),
+    ];
+
+    for (config_str, expected) in configs {
+        let full_config = format!("endpoint = \"http://localhost:4318\"\n{}", config_str);
+        let config: OpenTelemetryConfig = toml::from_str(&full_config).unwrap();
+
+        let compression_name = match config.http.compression {
+            Compression::None => "None",
+            Compression::Gzip(_) => "Gzip",
+            Compression::Zlib(_) => "Zlib",
+            Compression::Zstd(_) => "Zstd",
+            Compression::Snappy => "Snappy",
+        };
+
+        assert_eq!(
+            compression_name, expected,
+            "Failed for config: {}",
+            config_str
+        );
+    }
+}
+
+#[test]
+fn test_http_method_options() {
+    let post_config = r#"
+endpoint = "http://localhost:4318"
+
+[http]
+method = "post"
+"#;
+
+    let put_config = r#"
+endpoint = "http://localhost:4318"
+
+[http]
+method = "put"
+"#;
+
+    let post_parsed: OpenTelemetryConfig = toml::from_str(post_config).unwrap();
+    let put_parsed: OpenTelemetryConfig = toml::from_str(put_config).unwrap();
+
+    assert!(matches!(post_parsed.http.method, HttpMethod::Post));
+    assert!(matches!(put_parsed.http.method, HttpMethod::Put));
+}
+
+#[test]
+fn test_encoder_with_resource_attributes() {
+    use indexmap::IndexMap;
+
+    let mut otlp_config = OtlpConfig::default();
+    otlp_config.service_name = Some("test-service".to_string());
+    otlp_config.service_version = Some("1.0.0".to_string());
+    otlp_config.resource_attributes = IndexMap::from([
+        ("deployment.environment".to_string(), "test".to_string()),
+        ("k8s.cluster.name".to_string(), "test-cluster".to_string()),
+    ]);
+
+    let encoder = OtlpEncoder::new(otlp_config);
+
+    let mut log = LogEvent::from("test message with global resource attributes");
+    log.insert("host", "example.com");
+
+    let events = vec![Event::Log(log)];
+    let result = encoder.encode_logs(events).unwrap();
+
+    // Decode the protobuf to verify structure
+    let request = ExportLogsServiceRequest::decode(result.as_ref()).unwrap();
+    assert_eq!(request.resource_logs.len(), 1);
+
+    let resource_logs = &request.resource_logs[0];
+    let resource = resource_logs.resource.as_ref().unwrap();
+
+    // Verify global resource attributes are present
+    let attrs: std::collections::HashMap<String, String> = resource
+        .attributes
+        .iter()
+        .filter_map(|kv| {
+            if let Some(any_value) = &kv.value {
+                if let Some(value) = &any_value.value {
+                    match value {
+                        vector_lib::opentelemetry::proto::common::v1::any_value::Value::StringValue(s) => {
+                            Some((kv.key.clone(), s.clone()))
+                        }
+                        _ => None,
+                    }
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    assert_eq!(attrs.get("service.name"), Some(&"test-service".to_string()));
+    assert_eq!(attrs.get("service.version"), Some(&"1.0.0".to_string()));
+    assert_eq!(
+        attrs.get("deployment.environment"),
+        Some(&"test".to_string())
+    );
+    assert_eq!(
+        attrs.get("k8s.cluster.name"),
+        Some(&"test-cluster".to_string())
+    );
+}
+
+#[test]
+fn test_complex_production_config() {
+    let config_str = r#"
+endpoint = "https://otel-collector.prod.company.com:4318"
+logs_path = "/v1/logs"
+metrics_path = "/v1/metrics"
+traces_path = "/v1/traces"
+
+[http]
+method = "post"
+compression = "gzip"
+encoding = "protobuf"
+
+[otlp]
+service_name = "user-service"
+service_version = "2.4.1"
+max_export_batch_size = 1024
+export_timeout_secs = 30
+
+[otlp.resource_attributes]
+"service.name" = "user-service"
+"service.version" = "2.4.1"
+"deployment.environment" = "production"
+"k8s.cluster.name" = "prod-us-west-2"
+"k8s.namespace.name" = "services"
+"cloud.provider" = "aws"
+"cloud.region" = "us-west-2"
+"#;
+
+    let config: OpenTelemetryConfig = toml::from_str(config_str).unwrap();
+
+    // Verify endpoint and paths
+    assert_eq!(
+        config.endpoint,
+        "https://otel-collector.prod.company.com:4318"
+    );
+    assert_eq!(config.logs_path, "/v1/logs");
+
+    // Verify HTTP config
+    assert!(matches!(config.http.method, HttpMethod::Post));
+    assert!(matches!(config.http.compression, Compression::Gzip(_)));
+    assert!(matches!(config.http.encoding, ContentEncoding::Protobuf));
+
+    // Verify OTLP config
+    assert_eq!(config.otlp.service_name, Some("user-service".to_string()));
+    assert_eq!(config.otlp.service_version, Some("2.4.1".to_string()));
+    assert_eq!(config.otlp.max_export_batch_size, 1024);
+    assert_eq!(config.otlp.export_timeout_secs, 30);
+
+    // Verify resource attributes
+    assert_eq!(
+        config
+            .otlp
+            .resource_attributes
+            .get("deployment.environment"),
+        Some(&"production".to_string())
+    );
+    assert_eq!(
+        config.otlp.resource_attributes.get("k8s.cluster.name"),
+        Some(&"prod-us-west-2".to_string())
+    );
+    assert_eq!(
+        config.otlp.resource_attributes.get("cloud.provider"),
+        Some(&"aws".to_string())
+    );
+}
+
+#[test]
+fn test_minimal_config() {
+    let config_str = r#"
+endpoint = "http://localhost:4318"
+"#;
+
+    let config: OpenTelemetryConfig = toml::from_str(config_str).unwrap();
+
+    // Should use all defaults
+    assert_eq!(config.endpoint, "http://localhost:4318");
+    assert_eq!(config.logs_path, "/v1/logs");
+    assert!(matches!(config.http.method, HttpMethod::Post));
+    assert!(matches!(config.http.compression, Compression::None));
+    assert!(config.otlp.resource_attributes.is_empty());
+    assert!(config.otlp.service_name.is_none());
 }

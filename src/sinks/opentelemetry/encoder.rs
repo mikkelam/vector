@@ -36,32 +36,35 @@ use crate::{
     sinks::prelude::*,
 };
 
+use super::config::OtlpConfig;
+
 /// The encoder for OTLP, responsible for converting batches of events
 /// into Protobuf byte payloads.
 #[derive(Debug, Clone)]
-pub(super) struct OtlpEncoder;
+pub(super) struct OtlpEncoder {
+    otlp_config: OtlpConfig,
+}
 
 impl OtlpEncoder {
     /// Creates a new `OtlpEncoder`.
-    pub(super) const fn new() -> Self {
-        Self
+    pub(super) const fn new(otlp_config: OtlpConfig) -> Self {
+        Self { otlp_config }
     }
 
     /// Encodes a batch of log events into an `ExportLogsServiceRequest` Protobuf message.
     pub fn encode_logs(&self, events: Vec<Event>) -> Result<Bytes, ()> {
-        // For simplicity, put all logs in a single ResourceLogs with empty resource
-        // TODO: Group by actual resource attributes later
+        // For simplicity, put all logs in a single ResourceLogs with merged resource attributes
         let mut log_records = Vec::new();
-        let mut resource_attributes = Vec::new();
+        let mut event_resource_attributes = Vec::new();
 
         for event in events {
             let mut log = event.into_log();
 
-            // Extract resource attributes from the first event
-            if resource_attributes.is_empty() {
+            // Extract resource attributes from the first event only
+            if event_resource_attributes.is_empty() {
                 if let Some(resource_map) = log.remove(event_path!("resource")) {
                     if let Some(resource_obj) = resource_map.as_object() {
-                        resource_attributes =
+                        event_resource_attributes =
                             convert_object_map_to_key_value_vec(resource_obj.clone());
                     }
                 }
@@ -84,9 +87,12 @@ impl OtlpEncoder {
             schema_url: String::new(),
         }];
 
+        // Merge event resource attributes with global config attributes
+        let merged_resource_attributes = self.merge_resource_attributes(event_resource_attributes);
+
         let resource_logs = vec![ResourceLogs {
             resource: Some(Resource {
-                attributes: resource_attributes,
+                attributes: merged_resource_attributes,
                 dropped_attributes_count: 0,
             }),
             scope_logs,
@@ -153,14 +159,13 @@ impl OtlpEncoder {
         }
     }
 
+    /// Encodes a batch of metric events into an `ExportMetricsServiceRequest` Protobuf message.
     pub(super) fn encode_metrics(&self, events: Vec<Event>) -> Result<Bytes, ()> {
         let mut metric_records = Vec::new();
 
-        // Vector metrics typically don't have resource-level attributes in the same way as logs.
-        // Most Vector metric sources (internal_metrics, prometheus, etc.) don't provide
-        // resource-level context, and adding Vector's own service info would be misleading
-        // for metrics that originated from other services. Empty resource is valid per OTLP spec.
-        let resource_attributes = Vec::new();
+        // For metrics, we use the global config resource attributes to identify the Vector instance
+        // that's exporting these metrics, even if they originated from other services.
+        let resource_attributes = self.merge_resource_attributes(Vec::new());
 
         for event in events {
             let metric = event.into_metric();
@@ -195,9 +200,9 @@ impl OtlpEncoder {
     pub fn encode_traces(&self, events: Vec<Event>) -> Result<Bytes, ()> {
         let mut span_records = Vec::new();
 
-        // Vector trace events typically don't have resource-level attributes.
-        // Similar to metrics, we keep resource attributes empty to preserve transparency.
-        let resource_attributes = Vec::new();
+        // For traces, we use the global config resource attributes to identify the Vector instance
+        // that's processing these traces.
+        let resource_attributes = self.merge_resource_attributes(Vec::new());
 
         for event in events {
             let trace = event.into_trace();
@@ -227,6 +232,58 @@ impl OtlpEncoder {
         let request = ExportTraceServiceRequest { resource_spans };
 
         Ok(request.encode_to_vec().into())
+    }
+
+    /// Merges event-level resource attributes with global configuration attributes.
+    ///
+    /// Global config attributes take precedence over event attributes for consistency.
+    fn merge_resource_attributes(&self, event_attributes: Vec<KeyValue>) -> Vec<KeyValue> {
+        let mut merged_attributes = event_attributes;
+
+        // Add global resource attributes from config
+        for (key, value) in &self.otlp_config.resource_attributes {
+            // Check if this key already exists in event attributes
+            let key_exists = merged_attributes.iter().any(|kv| kv.key == *key);
+
+            if !key_exists {
+                merged_attributes.push(KeyValue {
+                    key: key.clone(),
+                    value: Some(AnyValue {
+                        value: Some(PbValue::StringValue(value.clone())),
+                    }),
+                });
+            }
+        }
+
+        // Add service name if configured and not already present
+        if let Some(service_name) = &self.otlp_config.service_name {
+            let service_name_exists = merged_attributes.iter().any(|kv| kv.key == "service.name");
+            if !service_name_exists {
+                merged_attributes.push(KeyValue {
+                    key: "service.name".to_string(),
+                    value: Some(AnyValue {
+                        value: Some(PbValue::StringValue(service_name.clone())),
+                    }),
+                });
+            }
+        }
+
+        // Add service version if configured and not already present
+        if let Some(service_version) = &self.otlp_config.service_version {
+            let service_version_exists = merged_attributes
+                .iter()
+                .any(|kv| kv.key == "service.version");
+            if !service_version_exists {
+                merged_attributes.push(KeyValue {
+                    key: "service.version".to_string(),
+                    value: Some(AnyValue {
+                        value: Some(PbValue::StringValue(service_version.clone())),
+                    }),
+                });
+            }
+        }
+
+        merged_attributes
     }
 }
 
