@@ -126,12 +126,52 @@ impl OtlpEncoder {
 
         let trace_id = log
             .remove(event_path!("trace_id"))
-            .and_then(|v| v.as_bytes().map(|b| b.to_vec()))
+            .and_then(|v| {
+                // Vector's OTLP source stores trace_id as hex string, decode it back to bytes
+                if let Some(hex_str) = v.as_str() {
+                    hex::decode(hex_str.as_ref())
+                        .ok()
+                        .filter(|bytes| bytes.len() == 16)
+                } else if let Some(bytes) = v.as_bytes() {
+                    // Raw bytes
+                    Some(bytes.to_vec()).filter(|bytes| bytes.len() == 16)
+                } else if let Some(array) = v.as_array() {
+                    // Array of integers (converted to bytes)
+                    let bytes: Result<Vec<u8>, _> = array
+                        .iter()
+                        .map(|v| v.as_integer().and_then(|i| u8::try_from(i).ok()))
+                        .collect::<Option<Vec<u8>>>()
+                        .ok_or(());
+                    bytes.ok().filter(|bytes| bytes.len() == 16)
+                } else {
+                    None
+                }
+            })
             .unwrap_or_default();
 
         let span_id = log
             .remove(event_path!("span_id"))
-            .and_then(|v| v.as_bytes().map(|b| b.to_vec()))
+            .and_then(|v| {
+                // Vector's OTLP source stores span_id as hex string, decode it back to bytes
+                if let Some(hex_str) = v.as_str() {
+                    hex::decode(hex_str.as_ref())
+                        .ok()
+                        .filter(|bytes| bytes.len() == 8)
+                } else if let Some(bytes) = v.as_bytes() {
+                    // Raw bytes
+                    Some(bytes.to_vec()).filter(|bytes| bytes.len() == 8)
+                } else if let Some(array) = v.as_array() {
+                    // Array of integers (converted to bytes)
+                    let bytes: Result<Vec<u8>, _> = array
+                        .iter()
+                        .map(|v| v.as_integer().and_then(|i| u8::try_from(i).ok()))
+                        .collect::<Option<Vec<u8>>>()
+                        .ok_or(());
+                    bytes.ok().filter(|bytes| bytes.len() == 8)
+                } else {
+                    None
+                }
+            })
             .unwrap_or_default();
 
         // Extract severity information
@@ -834,4 +874,83 @@ fn convert_value_to_span_link(value: &Value) -> Option<Link> {
         attributes,
         dropped_attributes_count,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::event::LogEvent;
+
+    #[test]
+    fn test_trace_id_hex_decoding() {
+        let encoder = OtlpEncoder::new(OtlpConfig::default());
+
+        // Create log event with hex string trace_id (as stored by Vector's OTLP source)
+        let mut log = LogEvent::from("test message");
+        log.insert("trace_id", "4ac52aadf321c2e531db005df08792f5"); // 32-char hex = 16 bytes
+        log.insert("span_id", "0b9e4bda2a55530d"); // 16-char hex = 8 bytes
+
+        let log_record = encoder.convert_log_event_to_log_record(log);
+
+        // Should decode hex strings to proper byte lengths
+        assert_eq!(log_record.trace_id.len(), 16);
+        assert_eq!(log_record.span_id.len(), 8);
+
+        // Verify actual decoded bytes
+        assert_eq!(
+            log_record.trace_id,
+            hex::decode("4ac52aadf321c2e531db005df08792f5").unwrap()
+        );
+        assert_eq!(log_record.span_id, hex::decode("0b9e4bda2a55530d").unwrap());
+    }
+
+    #[test]
+    fn test_invalid_trace_id_hex() {
+        let encoder = OtlpEncoder::new(OtlpConfig::default());
+
+        let mut log = LogEvent::from("test message");
+        log.insert("trace_id", "invalid_hex"); // Invalid hex
+        log.insert("span_id", "too_short"); // Too short
+
+        let log_record = encoder.convert_log_event_to_log_record(log);
+
+        // Should result in empty arrays for invalid data
+        assert_eq!(log_record.trace_id.len(), 0);
+        assert_eq!(log_record.span_id.len(), 0);
+    }
+
+    #[test]
+    fn test_missing_trace_context() {
+        let encoder = OtlpEncoder::new(OtlpConfig::default());
+
+        let log = LogEvent::from("test message");
+        let log_record = encoder.convert_log_event_to_log_record(log);
+
+        // Should result in empty arrays for missing data
+        assert_eq!(log_record.trace_id.len(), 0);
+        assert_eq!(log_record.span_id.len(), 0);
+    }
+
+    #[test]
+    fn test_hex_strings_from_source() {
+        let encoder = OtlpEncoder::new(OtlpConfig::default());
+
+        let mut log = LogEvent::from("test message");
+        // Insert hex strings as they come from Vector's OTLP source (legacy namespace)
+        log.insert("trace_id", "4ac52aadf321c2e531db005df08792f5"); // 32-char hex = 16 bytes
+        log.insert("span_id", "0b9e4bda2a55530d"); // 16-char hex = 8 bytes
+
+        let log_record = encoder.convert_log_event_to_log_record(log);
+
+        // Should decode hex strings to proper byte lengths
+        assert_eq!(log_record.trace_id.len(), 16);
+        assert_eq!(log_record.span_id.len(), 8);
+
+        // Verify actual decoded bytes match expected
+        assert_eq!(
+            log_record.trace_id,
+            hex::decode("4ac52aadf321c2e531db005df08792f5").unwrap()
+        );
+        assert_eq!(log_record.span_id, hex::decode("0b9e4bda2a55530d").unwrap());
+    }
 }
