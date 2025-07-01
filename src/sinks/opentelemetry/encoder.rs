@@ -5,6 +5,7 @@
 use std::io;
 
 use bytes::Bytes;
+use chrono::{DateTime, Utc};
 use hex;
 
 use prost::Message;
@@ -33,7 +34,8 @@ use vrl::{
 
 use crate::{
     event::{
-        metric::MetricSketch, Event, LogEvent, Metric as VectorMetric, MetricValue, TraceEvent,
+        metric::{Bucket, MetricSketch, Quantile, Sample},
+        Event, LogEvent, Metric as VectorMetric, MetricTags, MetricValue, TraceEvent,
     },
     sinks::{
         prelude::*,
@@ -100,24 +102,12 @@ impl OtlpEncoder {
             log_records.push(log_record);
         }
 
-        let scope_logs = vec![ScopeLogs {
-            // Vector acts as a transparent aggregator/router, not the original instrumentation library.
-            // Setting scope to None preserves the original instrumentation context from upstream sources.
-            // Per OTLP spec, scope identifies "the logical unit of software that emits the telemetry" -
-            // that's the original application, not Vector as the intermediary.
-            scope: None,
-            log_records,
-            schema_url: String::new(),
-        }];
+        let resource_attributes = self.merge_resource_attributes(event_resource_attributes);
 
-        // Merge event resource attributes with global config attributes
-        let merged_resource_attributes = self.merge_resource_attributes(event_resource_attributes);
+        let scope_logs = vec![self.create_scope_logs(log_records)];
 
         let resource_logs = vec![ResourceLogs {
-            resource: Some(Resource {
-                attributes: merged_resource_attributes,
-                dropped_attributes_count: 0,
-            }),
+            resource: Some(self.create_resource(resource_attributes)),
             scope_logs,
             schema_url: String::new(),
         }];
@@ -221,10 +211,6 @@ impl OtlpEncoder {
     pub(super) fn encode_metrics(&self, events: Vec<Event>) -> Result<Bytes, ()> {
         let mut metric_records = Vec::new();
 
-        // For metrics, we use the global config resource attributes to identify the Vector instance
-        // that's exporting these metrics, even if they originated from other services.
-        let resource_attributes = self.merge_resource_attributes(Vec::new());
-
         // Normalize metrics to absolute (cumulative) values for consistent OTLP semantics
         let mut normalizer = OtlpMetricNormalize::default();
         let mut metric_state = MetricSet::default();
@@ -239,21 +225,13 @@ impl OtlpEncoder {
             }
         }
 
-        let scope_metrics = vec![ScopeMetrics {
-            // Vector acts as a transparent aggregator/router, not the original instrumentation library.
-            // Setting scope to None preserves the original instrumentation context from upstream sources.
-            // Per OTLP spec, scope identifies "the logical unit of software that emits the telemetry" -
-            // that's the original application, not Vector as the intermediary.
-            scope: None,
-            metrics: metric_records,
-            schema_url: String::new(),
-        }];
+        // For metrics, we use the global config resource attributes to identify the Vector instance
+        let resource_attributes = self.merge_resource_attributes(Vec::new());
+
+        let scope_metrics = vec![self.create_scope_metrics(metric_records)];
 
         let resource_metrics = vec![ResourceMetrics {
-            resource: Some(Resource {
-                attributes: resource_attributes,
-                dropped_attributes_count: 0,
-            }),
+            resource: Some(self.create_resource(resource_attributes)),
             scope_metrics,
             schema_url: String::new(),
         }];
@@ -266,31 +244,19 @@ impl OtlpEncoder {
     pub fn encode_traces(&self, events: Vec<Event>) -> Result<Bytes, ()> {
         let mut span_records = Vec::new();
 
-        // For traces, we use the global config resource attributes to identify the Vector instance
-        // that's processing these traces.
-        let resource_attributes = self.merge_resource_attributes(Vec::new());
-
         for event in events {
             let trace = event.into_trace();
             let otlp_span = convert_vector_trace_to_otlp_span(trace);
             span_records.push(otlp_span);
         }
 
-        let scope_spans = vec![ScopeSpans {
-            // Vector acts as a transparent aggregator/router, not the original instrumentation library.
-            // Setting scope to None preserves the original instrumentation context from upstream sources.
-            // Per OTLP spec, scope identifies "the logical unit of software that emits the telemetry" -
-            // that's the original application, not Vector as the intermediary.
-            scope: None,
-            spans: span_records,
-            schema_url: String::new(),
-        }];
+        // For traces, we use the global config resource attributes to identify the Vector instance
+        let resource_attributes = self.merge_resource_attributes(Vec::new());
+
+        let scope_spans = vec![self.create_scope_spans(span_records)];
 
         let resource_spans = vec![ResourceSpans {
-            resource: Some(Resource {
-                attributes: resource_attributes,
-                dropped_attributes_count: 0,
-            }),
+            resource: Some(self.create_resource(resource_attributes)),
             scope_spans,
             schema_url: String::new(),
         }];
@@ -298,6 +264,41 @@ impl OtlpEncoder {
         let request = ExportTraceServiceRequest { resource_spans };
 
         Ok(request.encode_to_vec().into())
+    }
+
+    /// Creates a Resource with the given attributes.
+    fn create_resource(&self, attributes: Vec<KeyValue>) -> Resource {
+        Resource {
+            attributes,
+            dropped_attributes_count: 0,
+        }
+    }
+
+    /// Creates a ScopeLogs with the given log records.
+    fn create_scope_logs(&self, log_records: Vec<LogRecord>) -> ScopeLogs {
+        ScopeLogs {
+            scope: None, // Vector acts as a transparent aggregator/router
+            log_records,
+            schema_url: String::new(),
+        }
+    }
+
+    /// Creates a ScopeMetrics with the given metrics.
+    fn create_scope_metrics(&self, metrics: Vec<OtlpMetric>) -> ScopeMetrics {
+        ScopeMetrics {
+            scope: None, // Vector acts as a transparent aggregator/router
+            metrics,
+            schema_url: String::new(),
+        }
+    }
+
+    /// Creates a ScopeSpans with the given spans.
+    fn create_scope_spans(&self, spans: Vec<Span>) -> ScopeSpans {
+        ScopeSpans {
+            scope: None, // Vector acts as a transparent aggregator/router
+            spans,
+            schema_url: String::new(),
+        }
     }
 
     /// Merges event-level resource attributes with global configuration attributes.
@@ -672,8 +673,46 @@ fn convert_vector_metric_to_otlp(metric: VectorMetric) -> OtlpMetric {
     let description = String::new(); // Vector metrics don't have descriptions
     let unit = String::new(); // Vector metrics don't have units
 
-    // Convert metric tags to OTLP attributes
-    let attributes = if let Some(tags) = metric.tags() {
+    let attributes = convert_metric_tags_to_attributes(metric.tags());
+    let time_unix_nano = convert_timestamp_to_nanos(metric.timestamp());
+
+    let data = match metric.value() {
+        MetricValue::Counter { value } => {
+            convert_counter_to_otlp(&attributes, time_unix_nano, *value)
+        }
+        MetricValue::Gauge { value } => convert_gauge_to_otlp(&attributes, time_unix_nano, *value),
+        MetricValue::AggregatedHistogram {
+            buckets,
+            count,
+            sum,
+        } => convert_histogram_to_otlp(&attributes, time_unix_nano, buckets, *count, *sum),
+        MetricValue::AggregatedSummary {
+            quantiles,
+            count,
+            sum,
+        } => convert_summary_to_otlp(&attributes, time_unix_nano, quantiles, *count, *sum),
+        MetricValue::Set { values } => {
+            convert_set_to_otlp(&attributes, time_unix_nano, values.len())
+        }
+        MetricValue::Distribution {
+            samples,
+            statistic: _,
+        } => convert_distribution_to_otlp(&attributes, time_unix_nano, samples),
+        MetricValue::Sketch { sketch } => {
+            convert_sketch_to_otlp(&attributes, time_unix_nano, sketch)
+        }
+    };
+
+    OtlpMetric {
+        name,
+        description,
+        unit,
+        data,
+    }
+}
+
+fn convert_metric_tags_to_attributes(tags: Option<&MetricTags>) -> Vec<KeyValue> {
+    if let Some(tags) = tags {
         tags.iter_all()
             .map(|(key, value)| KeyValue {
                 key: key.to_string(),
@@ -684,244 +723,255 @@ fn convert_vector_metric_to_otlp(metric: VectorMetric) -> OtlpMetric {
             .collect()
     } else {
         Vec::new()
-    };
+    }
+}
 
-    // Convert timestamp to nanoseconds
-    let time_unix_nano = metric
-        .timestamp()
+fn convert_timestamp_to_nanos(timestamp: Option<DateTime<Utc>>) -> u64 {
+    timestamp
         .and_then(|ts| ts.timestamp_nanos_opt())
-        .unwrap_or(0) as u64;
+        .unwrap_or(0) as u64
+}
 
-    let data = match metric.value() {
-        MetricValue::Counter { value } => {
-            // NOTE: All metrics are normalized to absolute (cumulative) values using Vector's
-            // standard MetricSet normalization, so we always use Cumulative temporality.
-            // start_time_unix_nano = 0 indicates the metric has been cumulative since an
-            // unknown start time, which is semantically correct for normalized counters.
-            let data_point = NumberDataPoint {
-                attributes,
-                time_unix_nano,
-                start_time_unix_nano: 0, // Cumulative since unknown start time
-                value: Some(NumberDataPointValue::AsDouble(*value)),
-                exemplars: Vec::new(),
-                flags: 0,
-            };
-
-            Some(Data::Sum(Sum {
-                data_points: vec![data_point],
-                aggregation_temporality: AggregationTemporality::Cumulative as i32,
-                is_monotonic: true, // Counters are always monotonic
-            }))
-        }
-        MetricValue::Gauge { value } => {
-            let data_point = NumberDataPoint {
-                attributes,
-                time_unix_nano,
-                start_time_unix_nano: 0, // Gauges don't have a start time concept
-                value: Some(NumberDataPointValue::AsDouble(*value)),
-                exemplars: Vec::new(),
-                flags: 0,
-            };
-
-            Some(Data::Gauge(Gauge {
-                data_points: vec![data_point],
-            }))
-        }
-        MetricValue::AggregatedHistogram {
-            buckets,
-            count,
-            sum,
-        } => {
-            // Convert Vector buckets to OTLP format
-            let mut explicit_bounds = Vec::new();
-            let mut bucket_counts = Vec::new();
-
-            for bucket in buckets {
-                if bucket.upper_limit != f64::INFINITY {
-                    explicit_bounds.push(bucket.upper_limit);
-                }
-                bucket_counts.push(bucket.count);
-            }
-
-            let data_point = HistogramDataPoint {
-                attributes,
-                time_unix_nano,
-                start_time_unix_nano: 0, // Cumulative since unknown start time
-                count: *count,
-                sum: Some(*sum),
-                bucket_counts,
-                explicit_bounds,
-                exemplars: Vec::new(),
-                flags: 0,
-                min: None, // TODO: Track min/max if available
-                max: None,
-            };
-
-            Some(Data::Histogram(Histogram {
-                data_points: vec![data_point],
-                aggregation_temporality: AggregationTemporality::Cumulative as i32,
-            }))
-        }
-        MetricValue::AggregatedSummary {
-            quantiles,
-            count,
-            sum,
-        } => {
-            // Convert Vector quantiles to OTLP format
-            let quantile_values = quantiles
-                .iter()
-                .map(|q| ValueAtQuantile {
-                    quantile: q.quantile,
-                    value: q.value,
-                })
-                .collect();
-
-            let data_point = SummaryDataPoint {
-                attributes,
-                time_unix_nano,
-                start_time_unix_nano: 0, // Cumulative since unknown start time
-                count: *count,
-                sum: *sum,
-                quantile_values,
-                flags: 0,
-            };
-
-            Some(Data::Summary(Summary {
-                data_points: vec![data_point],
-            }))
-        }
-        MetricValue::Set { values } => {
-            // Convert set to gauge representing cardinality (number of unique values)
-            let data_point = NumberDataPoint {
-                attributes,
-                time_unix_nano,
-                start_time_unix_nano: 0, // Gauges don't have start times
-                value: Some(NumberDataPointValue::AsDouble(values.len() as f64)),
-                exemplars: Vec::new(),
-                flags: 0,
-            };
-
-            Some(Data::Gauge(Gauge {
-                data_points: vec![data_point],
-            }))
-        }
-        MetricValue::Distribution {
-            samples,
-            statistic: _,
-        } => {
-            // Convert distribution to histogram by creating buckets
-            // This is a basic conversion - in practice you might want more sophisticated bucketing
-            let mut bucket_counts = vec![0u64; 10]; // 10 buckets
-            let mut explicit_bounds = Vec::new();
-
-            // Create exponential buckets: 0.1, 1, 10, 100, 1000, etc.
-            for i in 0..9 {
-                explicit_bounds.push(10_f64.powi(i - 1));
-            }
-
-            let mut sum = 0.0;
-            let count = samples.len() as u64;
-
-            // Distribute samples into buckets
-            for sample in samples {
-                sum += sample.value;
-
-                // Find which bucket this sample falls into
-                let mut bucket_index = explicit_bounds.len();
-                for (i, &bound) in explicit_bounds.iter().enumerate() {
-                    if sample.value <= bound {
-                        bucket_index = i;
-                        break;
-                    }
-                }
-
-                // Increment all buckets up to and including the target bucket
-                for i in bucket_index..bucket_counts.len() {
-                    bucket_counts[i] += 1;
-                }
-            }
-
-            let data_point = HistogramDataPoint {
-                attributes,
-                time_unix_nano,
-                start_time_unix_nano: 0, // Cumulative since unknown start time
-                count,
-                sum: Some(sum),
-                bucket_counts,
-                explicit_bounds,
-                exemplars: Vec::new(),
-                flags: 0,
-                min: samples
-                    .iter()
-                    .map(|s| s.value)
-                    .fold(f64::INFINITY, f64::min)
-                    .into(),
-                max: samples
-                    .iter()
-                    .map(|s| s.value)
-                    .fold(f64::NEG_INFINITY, f64::max)
-                    .into(),
-            };
-
-            Some(Data::Histogram(Histogram {
-                data_points: vec![data_point],
-                aggregation_temporality: AggregationTemporality::Cumulative as i32,
-            }))
-        }
-        MetricValue::Sketch { sketch } => {
-            // Convert sketch to histogram using sketch's quantile information
-            // Use the sketch's internal bucket structure if available
-            match sketch {
-                MetricSketch::AgentDDSketch(ddsketch) => {
-                    let mut bucket_counts = Vec::new();
-                    let mut explicit_bounds = Vec::new();
-
-                    // Create buckets based on sketch quantiles
-                    let quantiles = [0.1, 0.25, 0.5, 0.75, 0.9, 0.95, 0.99];
-                    let mut previous_value = 0.0;
-
-                    for &q in &quantiles {
-                        if let Some(value) = ddsketch.quantile(q) {
-                            explicit_bounds.push(value);
-                            // Estimate count in this bucket (this is approximate)
-                            let estimated_count =
-                                ((q - previous_value) * ddsketch.count() as f64) as u64;
-                            bucket_counts.push(estimated_count);
-                            previous_value = q;
-                        }
-                    }
-
-                    // Add final bucket for remaining samples
-                    bucket_counts.push(((1.0 - previous_value) * ddsketch.count() as f64) as u64);
-
-                    let data_point = HistogramDataPoint {
-                        attributes,
-                        time_unix_nano,
-                        start_time_unix_nano: 0, // Cumulative since unknown start time
-                        count: ddsketch.count() as u64,
-                        sum: ddsketch.sum(),
-                        bucket_counts,
-                        explicit_bounds,
-                        exemplars: Vec::new(),
-                        flags: 0,
-                        min: ddsketch.min(),
-                        max: ddsketch.max(),
-                    };
-
-                    Some(Data::Histogram(Histogram {
-                        data_points: vec![data_point],
-                        aggregation_temporality: AggregationTemporality::Cumulative as i32,
-                    }))
-                }
-            }
-        }
+fn convert_counter_to_otlp(
+    attributes: &[KeyValue],
+    time_unix_nano: u64,
+    value: f64,
+) -> Option<Data> {
+    // NOTE: All metrics are normalized to absolute (cumulative) values using Vector's
+    // standard MetricSet normalization, so we always use Cumulative temporality.
+    // start_time_unix_nano = 0 indicates the metric has been cumulative since an
+    // unknown start time, which is semantically correct for normalized counters.
+    let data_point = NumberDataPoint {
+        attributes: attributes.to_vec(),
+        time_unix_nano,
+        start_time_unix_nano: 0, // Cumulative since unknown start time
+        value: Some(NumberDataPointValue::AsDouble(value)),
+        exemplars: Vec::new(),
+        flags: 0,
     };
 
-    OtlpMetric {
-        name,
-        description,
-        unit,
-        data,
+    Some(Data::Sum(Sum {
+        data_points: vec![data_point],
+        aggregation_temporality: AggregationTemporality::Cumulative as i32,
+        is_monotonic: true, // Counters are always monotonic
+    }))
+}
+
+fn convert_gauge_to_otlp(attributes: &[KeyValue], time_unix_nano: u64, value: f64) -> Option<Data> {
+    let data_point = NumberDataPoint {
+        attributes: attributes.to_vec(),
+        time_unix_nano,
+        start_time_unix_nano: 0, // Gauges don't have a start time concept
+        value: Some(NumberDataPointValue::AsDouble(value)),
+        exemplars: Vec::new(),
+        flags: 0,
+    };
+
+    Some(Data::Gauge(Gauge {
+        data_points: vec![data_point],
+    }))
+}
+
+fn convert_histogram_to_otlp(
+    attributes: &[KeyValue],
+    time_unix_nano: u64,
+    buckets: &[Bucket],
+    count: u64,
+    sum: f64,
+) -> Option<Data> {
+    let mut explicit_bounds = Vec::new();
+    let mut bucket_counts = Vec::new();
+
+    for bucket in buckets {
+        if bucket.upper_limit != f64::INFINITY {
+            explicit_bounds.push(bucket.upper_limit);
+        }
+        bucket_counts.push(bucket.count);
+    }
+
+    let data_point = HistogramDataPoint {
+        attributes: attributes.to_vec(),
+        time_unix_nano,
+        start_time_unix_nano: 0, // Cumulative since unknown start time
+        count,
+        sum: Some(sum),
+        bucket_counts,
+        explicit_bounds,
+        exemplars: Vec::new(),
+        flags: 0,
+        min: None, // TODO: Track min/max if available
+        max: None,
+    };
+
+    Some(Data::Histogram(Histogram {
+        data_points: vec![data_point],
+        aggregation_temporality: AggregationTemporality::Cumulative as i32,
+    }))
+}
+
+fn convert_summary_to_otlp(
+    attributes: &[KeyValue],
+    time_unix_nano: u64,
+    quantiles: &[Quantile],
+    count: u64,
+    sum: f64,
+) -> Option<Data> {
+    let quantile_values = quantiles
+        .iter()
+        .map(|q| ValueAtQuantile {
+            quantile: q.quantile,
+            value: q.value,
+        })
+        .collect();
+
+    let data_point = SummaryDataPoint {
+        attributes: attributes.to_vec(),
+        time_unix_nano,
+        start_time_unix_nano: 0, // Cumulative since unknown start time
+        count,
+        sum,
+        quantile_values,
+        flags: 0,
+    };
+
+    Some(Data::Summary(Summary {
+        data_points: vec![data_point],
+    }))
+}
+
+fn convert_set_to_otlp(
+    attributes: &[KeyValue],
+    time_unix_nano: u64,
+    cardinality: usize,
+) -> Option<Data> {
+    // Convert set to gauge representing cardinality (number of unique values)
+    let data_point = NumberDataPoint {
+        attributes: attributes.to_vec(),
+        time_unix_nano,
+        start_time_unix_nano: 0, // Gauges don't have start times
+        value: Some(NumberDataPointValue::AsDouble(cardinality as f64)),
+        exemplars: Vec::new(),
+        flags: 0,
+    };
+
+    Some(Data::Gauge(Gauge {
+        data_points: vec![data_point],
+    }))
+}
+
+fn convert_distribution_to_otlp(
+    attributes: &[KeyValue],
+    time_unix_nano: u64,
+    samples: &[Sample],
+) -> Option<Data> {
+    // Convert distribution to histogram by creating buckets
+    // This is a basic conversion - in practice you might want more sophisticated bucketing
+    let mut bucket_counts = vec![0u64; 10]; // 10 buckets
+    let mut explicit_bounds = Vec::new();
+
+    // Create exponential buckets: 0.1, 1, 10, 100, 1000, etc.
+    for i in 0..9 {
+        explicit_bounds.push(10_f64.powi(i - 1));
+    }
+
+    let mut sum = 0.0;
+    let count = samples.len() as u64;
+
+    // Distribute samples into buckets
+    for sample in samples {
+        sum += sample.value;
+
+        // Find which bucket this sample falls into
+        let mut bucket_index = explicit_bounds.len();
+        for (i, &bound) in explicit_bounds.iter().enumerate() {
+            if sample.value <= bound {
+                bucket_index = i;
+                break;
+            }
+        }
+
+        // Increment all buckets up to and including the target bucket
+        for i in bucket_index..bucket_counts.len() {
+            bucket_counts[i] += 1;
+        }
+    }
+
+    let data_point = HistogramDataPoint {
+        attributes: attributes.to_vec(),
+        time_unix_nano,
+        start_time_unix_nano: 0, // Cumulative since unknown start time
+        count,
+        sum: Some(sum),
+        bucket_counts,
+        explicit_bounds,
+        exemplars: Vec::new(),
+        flags: 0,
+        min: samples
+            .iter()
+            .map(|s| s.value)
+            .fold(f64::INFINITY, f64::min)
+            .into(),
+        max: samples
+            .iter()
+            .map(|s| s.value)
+            .fold(f64::NEG_INFINITY, f64::max)
+            .into(),
+    };
+
+    Some(Data::Histogram(Histogram {
+        data_points: vec![data_point],
+        aggregation_temporality: AggregationTemporality::Cumulative as i32,
+    }))
+}
+
+fn convert_sketch_to_otlp(
+    attributes: &[KeyValue],
+    time_unix_nano: u64,
+    sketch: &MetricSketch,
+) -> Option<Data> {
+    // Convert sketch to histogram using sketch's quantile information
+    // Use the sketch's internal bucket structure if available
+    match sketch {
+        MetricSketch::AgentDDSketch(ddsketch) => {
+            let mut bucket_counts = Vec::new();
+            let mut explicit_bounds = Vec::new();
+
+            // Create buckets based on sketch quantiles
+            let quantiles = [0.1, 0.25, 0.5, 0.75, 0.9, 0.95, 0.99];
+            let mut previous_value = 0.0;
+
+            for &q in &quantiles {
+                if let Some(value) = ddsketch.quantile(q) {
+                    explicit_bounds.push(value);
+                    // Estimate count in this bucket (this is approximate)
+                    let estimated_count = ((q - previous_value) * ddsketch.count() as f64) as u64;
+                    bucket_counts.push(estimated_count);
+                    previous_value = q;
+                }
+            }
+
+            // Add final bucket for remaining samples
+            bucket_counts.push(((1.0 - previous_value) * ddsketch.count() as f64) as u64);
+
+            let data_point = HistogramDataPoint {
+                attributes: attributes.to_vec(),
+                time_unix_nano,
+                start_time_unix_nano: 0, // Cumulative since unknown start time
+                count: ddsketch.count() as u64,
+                sum: ddsketch.sum(),
+                bucket_counts,
+                explicit_bounds,
+                exemplars: Vec::new(),
+                flags: 0,
+                min: ddsketch.min(),
+                max: ddsketch.max(),
+            };
+
+            Some(Data::Histogram(Histogram {
+                data_points: vec![data_point],
+                aggregation_temporality: AggregationTemporality::Cumulative as i32,
+            }))
+        }
     }
 }
 
