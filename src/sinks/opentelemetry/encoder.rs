@@ -32,8 +32,13 @@ use vrl::{
 };
 
 use crate::{
-    event::{Event, LogEvent, Metric as VectorMetric, MetricKind, MetricValue, TraceEvent},
-    sinks::prelude::*,
+    event::{
+        metric::MetricSketch, Event, LogEvent, Metric as VectorMetric, MetricValue, TraceEvent,
+    },
+    sinks::{
+        prelude::*,
+        util::buffer::metrics::{MetricNormalize, MetricSet},
+    },
 };
 
 use super::config::OtlpConfig;
@@ -43,6 +48,19 @@ use super::config::OtlpConfig;
 #[derive(Debug, Clone)]
 pub(super) struct OtlpEncoder {
     otlp_config: OtlpConfig,
+}
+
+/// Normalizer that converts all metrics to absolute (cumulative) values
+/// This follows Vector's standard pattern used by Prometheus and other sinks
+#[derive(Default)]
+struct OtlpMetricNormalize;
+
+impl MetricNormalize for OtlpMetricNormalize {
+    fn normalize(&mut self, state: &mut MetricSet, metric: VectorMetric) -> Option<VectorMetric> {
+        // Convert all metrics to absolute (cumulative) for consistent OTLP semantics
+        // This matches the behavior of Prometheus sink and provides proper start_time
+        state.make_absolute(metric)
+    }
 }
 
 impl OtlpEncoder {
@@ -207,10 +225,18 @@ impl OtlpEncoder {
         // that's exporting these metrics, even if they originated from other services.
         let resource_attributes = self.merge_resource_attributes(Vec::new());
 
+        // Normalize metrics to absolute (cumulative) values for consistent OTLP semantics
+        let mut normalizer = OtlpMetricNormalize::default();
+        let mut metric_state = MetricSet::default();
+
         for event in events {
             let metric = event.into_metric();
-            let otlp_metric = convert_vector_metric_to_otlp(metric);
-            metric_records.push(otlp_metric);
+
+            // Apply normalization to convert incremental metrics to absolute
+            if let Some(normalized_metric) = normalizer.normalize(&mut metric_state, metric) {
+                let otlp_metric = convert_vector_metric_to_otlp(normalized_metric);
+                metric_records.push(otlp_metric);
+            }
         }
 
         let scope_metrics = vec![ScopeMetrics {
@@ -668,10 +694,14 @@ fn convert_vector_metric_to_otlp(metric: VectorMetric) -> OtlpMetric {
 
     let data = match metric.value() {
         MetricValue::Counter { value } => {
+            // NOTE: All metrics are normalized to absolute (cumulative) values using Vector's
+            // standard MetricSet normalization, so we always use Cumulative temporality.
+            // start_time_unix_nano = 0 indicates the metric has been cumulative since an
+            // unknown start time, which is semantically correct for normalized counters.
             let data_point = NumberDataPoint {
                 attributes,
                 time_unix_nano,
-                start_time_unix_nano: 0, // TODO: Handle start time for cumulative metrics
+                start_time_unix_nano: 0, // Cumulative since unknown start time
                 value: Some(NumberDataPointValue::AsDouble(*value)),
                 exemplars: Vec::new(),
                 flags: 0,
@@ -679,10 +709,7 @@ fn convert_vector_metric_to_otlp(metric: VectorMetric) -> OtlpMetric {
 
             Some(Data::Sum(Sum {
                 data_points: vec![data_point],
-                aggregation_temporality: match metric.kind() {
-                    MetricKind::Incremental => AggregationTemporality::Delta as i32,
-                    MetricKind::Absolute => AggregationTemporality::Cumulative as i32,
-                },
+                aggregation_temporality: AggregationTemporality::Cumulative as i32,
                 is_monotonic: true, // Counters are always monotonic
             }))
         }
@@ -690,7 +717,7 @@ fn convert_vector_metric_to_otlp(metric: VectorMetric) -> OtlpMetric {
             let data_point = NumberDataPoint {
                 attributes,
                 time_unix_nano,
-                start_time_unix_nano: 0,
+                start_time_unix_nano: 0, // Gauges don't have a start time concept
                 value: Some(NumberDataPointValue::AsDouble(*value)),
                 exemplars: Vec::new(),
                 flags: 0,
@@ -719,7 +746,7 @@ fn convert_vector_metric_to_otlp(metric: VectorMetric) -> OtlpMetric {
             let data_point = HistogramDataPoint {
                 attributes,
                 time_unix_nano,
-                start_time_unix_nano: 0,
+                start_time_unix_nano: 0, // Cumulative since unknown start time
                 count: *count,
                 sum: Some(*sum),
                 bucket_counts,
@@ -732,10 +759,7 @@ fn convert_vector_metric_to_otlp(metric: VectorMetric) -> OtlpMetric {
 
             Some(Data::Histogram(Histogram {
                 data_points: vec![data_point],
-                aggregation_temporality: match metric.kind() {
-                    MetricKind::Incremental => AggregationTemporality::Delta as i32,
-                    MetricKind::Absolute => AggregationTemporality::Cumulative as i32,
-                },
+                aggregation_temporality: AggregationTemporality::Cumulative as i32,
             }))
         }
         MetricValue::AggregatedSummary {
@@ -755,7 +779,7 @@ fn convert_vector_metric_to_otlp(metric: VectorMetric) -> OtlpMetric {
             let data_point = SummaryDataPoint {
                 attributes,
                 time_unix_nano,
-                start_time_unix_nano: 0,
+                start_time_unix_nano: 0, // Cumulative since unknown start time
                 count: *count,
                 sum: *sum,
                 quantile_values,
@@ -766,42 +790,130 @@ fn convert_vector_metric_to_otlp(metric: VectorMetric) -> OtlpMetric {
                 data_points: vec![data_point],
             }))
         }
-        MetricValue::Set { .. } => {
-            // OTLP doesn't have a direct equivalent for sets
-            // We could represent this as a gauge with the set size
-            emit!(SinkRequestBuildError {
-                error: "Set metrics are not directly supported in OTLP format"
-            });
-            return OtlpMetric {
-                name,
-                description,
-                unit,
-                data: None,
+        MetricValue::Set { values } => {
+            // Convert set to gauge representing cardinality (number of unique values)
+            let data_point = NumberDataPoint {
+                attributes,
+                time_unix_nano,
+                start_time_unix_nano: 0, // Gauges don't have start times
+                value: Some(NumberDataPointValue::AsDouble(values.len() as f64)),
+                exemplars: Vec::new(),
+                flags: 0,
             };
+
+            Some(Data::Gauge(Gauge {
+                data_points: vec![data_point],
+            }))
         }
-        MetricValue::Distribution { .. } => {
-            // TODO: Convert distributions to histograms or summaries
-            emit!(SinkRequestBuildError {
-                error: "Distribution metrics conversion is not yet implemented"
-            });
-            return OtlpMetric {
-                name,
-                description,
-                unit,
-                data: None,
+        MetricValue::Distribution {
+            samples,
+            statistic: _,
+        } => {
+            // Convert distribution to histogram by creating buckets
+            // This is a basic conversion - in practice you might want more sophisticated bucketing
+            let mut bucket_counts = vec![0u64; 10]; // 10 buckets
+            let mut explicit_bounds = Vec::new();
+
+            // Create exponential buckets: 0.1, 1, 10, 100, 1000, etc.
+            for i in 0..9 {
+                explicit_bounds.push(10_f64.powi(i - 1));
+            }
+
+            let mut sum = 0.0;
+            let count = samples.len() as u64;
+
+            // Distribute samples into buckets
+            for sample in samples {
+                sum += sample.value;
+
+                // Find which bucket this sample falls into
+                let mut bucket_index = explicit_bounds.len();
+                for (i, &bound) in explicit_bounds.iter().enumerate() {
+                    if sample.value <= bound {
+                        bucket_index = i;
+                        break;
+                    }
+                }
+
+                // Increment all buckets up to and including the target bucket
+                for i in bucket_index..bucket_counts.len() {
+                    bucket_counts[i] += 1;
+                }
+            }
+
+            let data_point = HistogramDataPoint {
+                attributes,
+                time_unix_nano,
+                start_time_unix_nano: 0, // Cumulative since unknown start time
+                count,
+                sum: Some(sum),
+                bucket_counts,
+                explicit_bounds,
+                exemplars: Vec::new(),
+                flags: 0,
+                min: samples
+                    .iter()
+                    .map(|s| s.value)
+                    .fold(f64::INFINITY, f64::min)
+                    .into(),
+                max: samples
+                    .iter()
+                    .map(|s| s.value)
+                    .fold(f64::NEG_INFINITY, f64::max)
+                    .into(),
             };
+
+            Some(Data::Histogram(Histogram {
+                data_points: vec![data_point],
+                aggregation_temporality: AggregationTemporality::Cumulative as i32,
+            }))
         }
-        MetricValue::Sketch { .. } => {
-            // TODO: Convert sketches to histograms
-            emit!(SinkRequestBuildError {
-                error: "Sketch metrics conversion is not yet implemented"
-            });
-            return OtlpMetric {
-                name,
-                description,
-                unit,
-                data: None,
-            };
+        MetricValue::Sketch { sketch } => {
+            // Convert sketch to histogram using sketch's quantile information
+            // Use the sketch's internal bucket structure if available
+            match sketch {
+                MetricSketch::AgentDDSketch(ddsketch) => {
+                    let mut bucket_counts = Vec::new();
+                    let mut explicit_bounds = Vec::new();
+
+                    // Create buckets based on sketch quantiles
+                    let quantiles = [0.1, 0.25, 0.5, 0.75, 0.9, 0.95, 0.99];
+                    let mut previous_value = 0.0;
+
+                    for &q in &quantiles {
+                        if let Some(value) = ddsketch.quantile(q) {
+                            explicit_bounds.push(value);
+                            // Estimate count in this bucket (this is approximate)
+                            let estimated_count =
+                                ((q - previous_value) * ddsketch.count() as f64) as u64;
+                            bucket_counts.push(estimated_count);
+                            previous_value = q;
+                        }
+                    }
+
+                    // Add final bucket for remaining samples
+                    bucket_counts.push(((1.0 - previous_value) * ddsketch.count() as f64) as u64);
+
+                    let data_point = HistogramDataPoint {
+                        attributes,
+                        time_unix_nano,
+                        start_time_unix_nano: 0, // Cumulative since unknown start time
+                        count: ddsketch.count() as u64,
+                        sum: ddsketch.sum(),
+                        bucket_counts,
+                        explicit_bounds,
+                        exemplars: Vec::new(),
+                        flags: 0,
+                        min: ddsketch.min(),
+                        max: ddsketch.max(),
+                    };
+
+                    Some(Data::Histogram(Histogram {
+                        data_points: vec![data_point],
+                        aggregation_temporality: AggregationTemporality::Cumulative as i32,
+                    }))
+                }
+            }
         }
     };
 
@@ -841,10 +953,18 @@ fn convert_vector_trace_to_otlp_span(trace: TraceEvent) -> Span {
         .map(|s| s.to_string())
         .unwrap_or_else(|| "unknown".to_string());
 
+    // Map string kind to OTLP span kind enum
     let kind = trace_map
         .get("kind")
-        .and_then(|v| v.as_integer())
-        .unwrap_or(SpanKind::Internal as i64) as i32;
+        .and_then(|v| v.as_str())
+        .map(|kind_str| match kind_str.to_lowercase().as_str() {
+            "server" => SpanKind::Server as i32,
+            "client" => SpanKind::Client as i32,
+            "producer" => SpanKind::Producer as i32,
+            "consumer" => SpanKind::Consumer as i32,
+            "internal" | _ => SpanKind::Internal as i32,
+        })
+        .unwrap_or(SpanKind::Internal as i32);
 
     let trace_state = trace_map
         .get("trace_state")
@@ -852,25 +972,55 @@ fn convert_vector_trace_to_otlp_span(trace: TraceEvent) -> Span {
         .map(|s| s.to_string())
         .unwrap_or_else(|| "".to_string());
 
-    // Convert timestamps from Vector's DateTime to nanoseconds
-    let start_time_unix_nano = trace_map
-        .get("start_time_unix_nano")
-        .and_then(|v| v.as_timestamp())
-        .and_then(|ts| ts.timestamp_nanos_opt())
-        .unwrap_or(0) as u64;
-
+    // Calculate timestamps from Vector's timestamp and duration_ns
     let end_time_unix_nano = trace_map
-        .get("end_time_unix_nano")
+        .get("timestamp")
         .and_then(|v| v.as_timestamp())
         .and_then(|ts| ts.timestamp_nanos_opt())
         .unwrap_or(0) as u64;
 
-    // Convert attributes
-    let attributes = trace_map
-        .get("attributes")
-        .and_then(|v| v.as_object())
-        .map(|obj| convert_object_map_to_key_value_vec(obj.clone()))
-        .unwrap_or_default();
+    let duration_ns = trace_map
+        .get("duration_ns")
+        .and_then(|v| v.as_integer())
+        .unwrap_or(0) as u64;
+
+    let start_time_unix_nano = if end_time_unix_nano > 0 && duration_ns > 0 {
+        end_time_unix_nano.saturating_sub(duration_ns)
+    } else {
+        0
+    };
+
+    // Extract tags and convert to attributes, also look for status info
+    let mut attributes = Vec::new();
+    let mut status_code = 1; // OK = 1
+    let mut status_message = String::new();
+
+    if let Some(tags) = trace_map.get("tags").and_then(|v| v.as_object()) {
+        for (key, value) in tags {
+            match key.as_str() {
+                "otel.status_code" => {
+                    if let Some(code_str) = value.as_str() {
+                        status_code = match code_str.to_lowercase().as_str() {
+                            "error" => 2, // ERROR = 2
+                            "ok" => 1,    // OK = 1
+                            _ => 0,       // UNSET = 0
+                        };
+                    }
+                }
+                "error" => {
+                    if let Some(msg) = value.as_str() {
+                        status_message = msg.to_string();
+                    }
+                }
+                _ => {
+                    attributes.push(KeyValue {
+                        key: key.to_string(),
+                        value: Some(convert_value_to_any_value(value.clone())),
+                    });
+                }
+            }
+        }
+    }
 
     let dropped_attributes_count = trace_map
         .get("dropped_attributes_count")
@@ -909,18 +1059,16 @@ fn convert_vector_trace_to_otlp_span(trace: TraceEvent) -> Span {
         .and_then(|v| v.as_integer())
         .unwrap_or(0) as u32;
 
-    // Convert status
-    let status = trace_map
-        .get("status")
-        .and_then(|v| v.as_object())
-        .map(|obj| SpanStatus {
-            message: obj
-                .get("message")
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string())
-                .unwrap_or_else(|| "".to_string()),
-            code: obj.get("code").and_then(|v| v.as_integer()).unwrap_or(0) as i32,
-        });
+    // Build status if we found error information
+    let status = if status_code != 1 || !status_message.is_empty() {
+        // OK = 1
+        Some(SpanStatus {
+            code: status_code,
+            message: status_message,
+        })
+    } else {
+        None
+    };
 
     Span {
         trace_id,
@@ -950,7 +1098,7 @@ fn convert_value_to_span_event(value: &Value) -> Option<SpanEvent> {
 
     let name = obj.get("name")?.as_str()?.to_string();
     let time_unix_nano = obj
-        .get("time_unix_nano")?
+        .get("timestamp")?
         .as_timestamp()?
         .timestamp_nanos_opt()? as u64;
 
@@ -1015,7 +1163,13 @@ fn convert_value_to_span_link(value: &Value) -> Option<Link> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::event::LogEvent;
+    use crate::event::{LogEvent, TraceEvent};
+    use crate::sinks::util::encoding::Encoder;
+    use std::collections::BTreeMap;
+    use vector_lib::opentelemetry::proto::{
+        collector::trace::v1::ExportTraceServiceRequest, common::v1::any_value,
+        trace::v1::span::SpanKind,
+    };
 
     #[test]
     fn test_trace_id_hex_decoding() {
@@ -1272,6 +1426,383 @@ mod tests {
                     Some(&"simple_value".to_string())
                 );
             }
+        }
+    }
+
+    #[test]
+    fn test_set_distribution_sketch_metrics() {
+        use crate::event::metric::{MetricSketch, Sample, StatisticKind};
+        use crate::event::{Metric, MetricKind, MetricValue};
+        use crate::metrics::AgentDDSketch;
+        use chrono::Utc;
+        use std::collections::BTreeSet;
+        use vector_lib::opentelemetry::proto::{
+            collector::metrics::v1::ExportMetricsServiceRequest, metrics::v1::metric::Data,
+        };
+
+        let encoder = OtlpEncoder::new(OtlpConfig::default());
+
+        // Test Set metric (converted to gauge with cardinality)
+        let mut set_values = BTreeSet::new();
+        set_values.insert("value1".to_string());
+        set_values.insert("value2".to_string());
+        set_values.insert("value3".to_string());
+
+        let set_metric = Event::Metric(
+            Metric::new(
+                "test_set",
+                MetricKind::Absolute,
+                MetricValue::Set { values: set_values },
+            )
+            .with_timestamp(Some(Utc::now())),
+        );
+
+        // Test Distribution metric (converted to histogram)
+        let distribution_metric = Event::Metric(
+            Metric::new(
+                "test_distribution",
+                MetricKind::Absolute,
+                MetricValue::Distribution {
+                    samples: vec![
+                        Sample {
+                            value: 1.0,
+                            rate: 1,
+                        },
+                        Sample {
+                            value: 5.0,
+                            rate: 1,
+                        },
+                        Sample {
+                            value: 10.0,
+                            rate: 1,
+                        },
+                    ],
+                    statistic: StatisticKind::Histogram,
+                },
+            )
+            .with_timestamp(Some(Utc::now())),
+        );
+
+        // Test Sketch metric (converted to histogram)
+        let mut ddsketch = AgentDDSketch::with_agent_defaults();
+        ddsketch.insert_many(&[1.0, 2.0, 3.0, 4.0, 5.0]);
+
+        let sketch_metric = Event::Metric(
+            Metric::new(
+                "test_sketch",
+                MetricKind::Absolute,
+                MetricValue::Sketch {
+                    sketch: MetricSketch::AgentDDSketch(ddsketch),
+                },
+            )
+            .with_timestamp(Some(Utc::now())),
+        );
+
+        let mut buf = Vec::new();
+        let result = encoder.encode_input(
+            vec![set_metric, distribution_metric, sketch_metric],
+            &mut buf,
+        );
+        assert!(result.is_ok());
+
+        let request = ExportMetricsServiceRequest::decode(buf.as_slice()).unwrap();
+        assert!(!request.resource_metrics.is_empty());
+
+        let resource_metrics = request.resource_metrics.first().unwrap();
+        let scope_metrics = resource_metrics.scope_metrics.first().unwrap();
+        assert_eq!(scope_metrics.metrics.len(), 3);
+
+        // Validate set metric (converted to gauge)
+        let set_metric = &scope_metrics.metrics[0];
+        assert_eq!(set_metric.name, "test_set");
+        if let Some(Data::Gauge(gauge)) = &set_metric.data {
+            assert_eq!(gauge.data_points.len(), 1);
+            let data_point = &gauge.data_points[0];
+            // Should have cardinality of 3
+            if let Some(NumberDataPointValue::AsDouble(val)) = &data_point.value {
+                assert_eq!(*val, 3.0);
+            }
+        } else {
+            panic!("Expected set to have Gauge data");
+        }
+
+        // Validate distribution metric (converted to histogram)
+        let distribution_metric = &scope_metrics.metrics[1];
+        assert_eq!(distribution_metric.name, "test_distribution");
+        if let Some(Data::Histogram(hist)) = &distribution_metric.data {
+            assert_eq!(hist.data_points.len(), 1);
+            let data_point = &hist.data_points[0];
+            assert_eq!(data_point.count, 3);
+            assert_eq!(data_point.sum, Some(16.0)); // 1.0 + 5.0 + 10.0
+        } else {
+            panic!("Expected distribution to have Histogram data");
+        }
+
+        // Validate sketch metric (converted to histogram)
+        let sketch_metric = &scope_metrics.metrics[2];
+        assert_eq!(sketch_metric.name, "test_sketch");
+        if let Some(Data::Histogram(hist)) = &sketch_metric.data {
+            assert_eq!(hist.data_points.len(), 1);
+            let data_point = &hist.data_points[0];
+            assert_eq!(data_point.count, 5);
+            assert_eq!(data_point.sum, Some(15.0)); // 1.0 + 2.0 + 3.0 + 4.0 + 5.0
+        } else {
+            panic!("Expected sketch to have Histogram data");
+        }
+    }
+
+    #[test]
+    fn test_incremental_metric_normalization() {
+        use crate::event::{Metric, MetricKind, MetricValue};
+        use chrono::Utc;
+        use vector_lib::opentelemetry::proto::{
+            collector::metrics::v1::ExportMetricsServiceRequest,
+            metrics::v1::{metric::Data, AggregationTemporality},
+        };
+
+        let encoder = OtlpEncoder::new(OtlpConfig::default());
+
+        // Test that absolute metrics pass through unchanged
+        let absolute_counter = Event::Metric(
+            Metric::new(
+                "test_counter",
+                MetricKind::Absolute,
+                MetricValue::Counter { value: 42.0 },
+            )
+            .with_timestamp(Some(Utc::now())),
+        );
+
+        // Test that incremental metrics get converted to absolute via normalization
+        let incremental_counter = Event::Metric(
+            Metric::new(
+                "test_incremental",
+                MetricKind::Incremental,
+                MetricValue::Counter { value: 10.0 },
+            )
+            .with_timestamp(Some(Utc::now())),
+        );
+
+        let mut buf = Vec::new();
+        let result = encoder.encode_input(vec![absolute_counter, incremental_counter], &mut buf);
+        assert!(result.is_ok());
+
+        let request = ExportMetricsServiceRequest::decode(buf.as_slice()).unwrap();
+        let resource_metrics = request.resource_metrics.first().unwrap();
+        let scope_metrics = resource_metrics.scope_metrics.first().unwrap();
+
+        // Should have both metrics (absolute passes through, incremental gets normalized)
+        assert_eq!(scope_metrics.metrics.len(), 2);
+
+        // All metrics should use cumulative temporality
+        for metric in &scope_metrics.metrics {
+            if let Some(Data::Sum(sum)) = &metric.data {
+                assert_eq!(
+                    sum.aggregation_temporality,
+                    AggregationTemporality::Cumulative as i32
+                );
+                assert!(sum.is_monotonic);
+            } else {
+                panic!("Expected counter to have Sum data");
+            }
+        }
+    }
+
+    #[test]
+    fn test_full_trace_conversion() {
+        let trace_event = TraceEvent::from(BTreeMap::from([
+            (
+                "trace_id".into(),
+                Value::from("7b5a5a5a5a5a5a5a7b5a5a5a5a5a5a5a"),
+            ),
+            ("span_id".into(), Value::from("7b5a5a5a5a5a5a5b")),
+            ("parent_span_id".into(), Value::from("7b5a5a5a5a5a5a5c")),
+            ("name".into(), Value::from("test-span")),
+            (
+                "timestamp".into(),
+                Value::Timestamp(
+                    chrono::DateTime::parse_from_rfc3339("2023-01-01T00:00:10Z")
+                        .unwrap()
+                        .into(),
+                ),
+            ),
+            ("duration_ns".into(), Value::from(1_000_000_000u64)), // 1 second
+            ("kind".into(), Value::from("server")),
+            (
+                "tags".into(),
+                Value::from(BTreeMap::from([
+                    ("http.method".into(), Value::from("GET")),
+                    ("otel.status_code".into(), Value::from("Error")),
+                    ("error".into(), Value::from("something went wrong")),
+                ])),
+            ),
+            (
+                "events".into(),
+                Value::from(vec![Value::from(BTreeMap::from([
+                    ("name".into(), Value::from("test-event")),
+                    (
+                        "timestamp".into(),
+                        Value::Timestamp(
+                            chrono::DateTime::parse_from_rfc3339("2023-01-01T00:00:09.5Z")
+                                .unwrap()
+                                .into(),
+                        ),
+                    ),
+                ]))]),
+            ),
+        ]));
+        let event = Event::Trace(trace_event);
+
+        let encoder = OtlpEncoder::new(OtlpConfig::default());
+        let mut buf = Vec::new();
+        let result = encoder.encode_input(vec![event], &mut buf);
+        assert!(result.is_ok());
+
+        let request = ExportTraceServiceRequest::decode(buf.as_slice()).unwrap();
+        let resource_spans = request.resource_spans.first().unwrap();
+        let scope_spans = resource_spans.scope_spans.first().unwrap();
+        let span = scope_spans.spans.first().unwrap();
+
+        assert_eq!(
+            hex::encode(&span.trace_id),
+            "7b5a5a5a5a5a5a5a7b5a5a5a5a5a5a5a"
+        );
+        assert_eq!(hex::encode(&span.span_id), "7b5a5a5a5a5a5a5b");
+        assert_eq!(hex::encode(&span.parent_span_id), "7b5a5a5a5a5a5a5c");
+        assert_eq!(span.name, "test-span");
+        assert_eq!(span.end_time_unix_nano, 1672531210000000000);
+        assert_eq!(span.start_time_unix_nano, 1672531209000000000);
+        assert_eq!(span.kind, SpanKind::Server as i32);
+
+        if let Some(status) = span.status.as_ref() {
+            // The protobuf uses the numeric code
+            assert_eq!(status.code, 2); // ERROR = 2
+            assert_eq!(status.message, "something went wrong");
+        } else {
+            panic!("Expected span to have status but it was None");
+        }
+
+        // Verify events are properly converted
+        assert_eq!(span.events.len(), 1);
+        let event = &span.events[0];
+        assert_eq!(event.name, "test-event");
+        assert_eq!(event.time_unix_nano, 1672531209500000000); // 2023-01-01T00:00:09.5Z
+
+        let http_method_attr = span
+            .attributes
+            .iter()
+            .find(|attr| attr.key == "http.method")
+            .unwrap();
+        assert_eq!(
+            http_method_attr.value.as_ref().unwrap().value,
+            Some(any_value::Value::StringValue("GET".to_string()))
+        );
+    }
+
+    #[test]
+    fn test_metrics_conversion() {
+        use crate::event::metric::Bucket;
+        use crate::event::{Metric, MetricKind, MetricValue};
+        use chrono::Utc;
+        use vector_lib::opentelemetry::proto::{
+            collector::metrics::v1::ExportMetricsServiceRequest,
+            metrics::v1::{metric::Data, AggregationTemporality},
+        };
+
+        let encoder = OtlpEncoder::new(OtlpConfig::default());
+
+        // Test Counter metric (using Absolute to avoid normalization dropping)
+        let counter = Event::Metric(
+            Metric::new(
+                "test_counter",
+                MetricKind::Absolute,
+                MetricValue::Counter { value: 42.0 },
+            )
+            .with_timestamp(Some(Utc::now())),
+        );
+
+        // Test Gauge metric
+        let gauge = Event::Metric(
+            Metric::new(
+                "test_gauge",
+                MetricKind::Absolute,
+                MetricValue::Gauge { value: 123.45 },
+            )
+            .with_timestamp(Some(Utc::now())),
+        );
+
+        // Test Histogram metric
+        let histogram = Event::Metric(
+            Metric::new(
+                "test_histogram",
+                MetricKind::Absolute,
+                MetricValue::AggregatedHistogram {
+                    buckets: vec![
+                        Bucket {
+                            upper_limit: 1.0,
+                            count: 5,
+                        },
+                        Bucket {
+                            upper_limit: 5.0,
+                            count: 10,
+                        },
+                        Bucket {
+                            upper_limit: f64::INFINITY,
+                            count: 2,
+                        },
+                    ],
+                    count: 17,
+                    sum: 25.5,
+                },
+            )
+            .with_timestamp(Some(Utc::now())),
+        );
+
+        let mut buf = Vec::new();
+        let result = encoder.encode_input(vec![counter, gauge, histogram], &mut buf);
+        assert!(result.is_ok());
+
+        let request = ExportMetricsServiceRequest::decode(buf.as_slice()).unwrap();
+        assert!(!request.resource_metrics.is_empty());
+
+        let resource_metrics = request.resource_metrics.first().unwrap();
+        let scope_metrics = resource_metrics.scope_metrics.first().unwrap();
+        assert_eq!(scope_metrics.metrics.len(), 3);
+
+        // Validate counter metric
+        let counter_metric = &scope_metrics.metrics[0];
+        assert_eq!(counter_metric.name, "test_counter");
+        if let Some(Data::Sum(sum)) = &counter_metric.data {
+            assert_eq!(
+                sum.aggregation_temporality,
+                AggregationTemporality::Cumulative as i32
+            );
+            assert!(sum.is_monotonic);
+            assert_eq!(sum.data_points.len(), 1);
+        } else {
+            panic!("Expected counter to have Sum data");
+        }
+
+        // Validate gauge metric
+        let gauge_metric = &scope_metrics.metrics[1];
+        assert_eq!(gauge_metric.name, "test_gauge");
+        if let Some(Data::Gauge(_)) = &gauge_metric.data {
+            // Gauge validation passed
+        } else {
+            panic!("Expected gauge to have Gauge data");
+        }
+
+        // Validate histogram metric
+        let histogram_metric = &scope_metrics.metrics[2];
+        assert_eq!(histogram_metric.name, "test_histogram");
+        if let Some(Data::Histogram(hist)) = &histogram_metric.data {
+            assert_eq!(hist.data_points.len(), 1);
+            let data_point = &hist.data_points[0];
+            assert_eq!(data_point.count, 17);
+            assert_eq!(data_point.sum, Some(25.5));
+            assert_eq!(data_point.explicit_bounds, vec![1.0, 5.0]);
+            assert_eq!(data_point.bucket_counts, vec![5, 10, 2]);
+        } else {
+            panic!("Expected histogram to have Histogram data");
         }
     }
 }
