@@ -3,19 +3,20 @@
 use std::str::FromStr;
 
 use http::{Method, Request, Uri};
-use indexmap::IndexMap;
 
 use crate::{
     http::{Auth, HttpClient},
     sinks::{
         prelude::*,
         util::{
-            http::{http_response_retry_logic, HttpService, RequestConfig},
+            http::{http_response_retry_logic, validate_headers, HttpService, RequestConfig},
             service::ServiceBuilderExt,
             BatchConfig, Compression, RealtimeSizeBasedDefaultBatchSettings, UriSerde,
         },
     },
 };
+use http::{header::AUTHORIZATION, HeaderName, HeaderValue};
+use indexmap::IndexMap;
 
 use super::{
     request_builder::OtlpRequestBuilder, service::OtlpServiceRequestBuilder,
@@ -325,6 +326,15 @@ pub struct OpenTelemetryConfig {
     #[serde(default)]
     auth: Option<Auth>,
 
+    /// Custom HTTP headers to add to every HTTP request.
+    ///
+    /// # Examples
+    ///
+    /// ```toml
+    /// [sinks.my_opentelemetry_sink.request.headers]
+    /// X-API-Key = "secret-key"
+    /// X-Custom-Header = "custom-value"
+    /// ```
     #[configurable(derived)]
     #[serde(default)]
     request: RequestConfig,
@@ -443,11 +453,15 @@ impl OpenTelemetryConfig {
         let traces_endpoint = endpoint.append_path(&self.traces_path.trim_start_matches('/'))?;
         let metrics_endpoint = endpoint.append_path(&self.metrics_path.trim_start_matches('/'))?;
 
+        let validated_headers =
+            validate_opentelemetry_headers(&self.request.headers, self.auth.is_some())?;
+
         let service_builder = OtlpServiceRequestBuilder {
             auth: self.auth.clone(),
             method: self.http.method,
             compression: self.http.compression.clone(),
             encoding: self.http.encoding,
+            headers: validated_headers,
         };
 
         let service = ServiceBuilder::new()
@@ -519,6 +533,22 @@ async fn healthcheck(
         s if s.is_success() || s.is_client_error() => Ok(()),
         other => Err(HealthcheckError::UnexpectedStatus { status: other }.into()),
     }
+}
+
+/// Validates headers for OpenTelemetry sink, checking for auth conflicts
+fn validate_opentelemetry_headers(
+    headers: &IndexMap<String, String>,
+    configures_auth: bool,
+) -> crate::Result<IndexMap<HeaderName, HeaderValue>> {
+    let headers = validate_headers(headers)?;
+
+    for name in headers.keys() {
+        if configures_auth && name == AUTHORIZATION {
+            return Err("Authorization header cannot be used with defined auth options".into());
+        }
+    }
+
+    Ok(headers)
 }
 
 #[cfg(test)]
@@ -713,5 +743,168 @@ mod tests {
             }
             Err(error) => panic!("Expected successful build but got error: {}", error),
         }
+    }
+
+    #[tokio::test]
+    async fn test_custom_headers_applied() {
+        use http::HeaderName;
+        use indexmap::IndexMap;
+
+        let mut headers = IndexMap::new();
+        headers.insert("X-Custom-Header".to_string(), "custom-value".to_string());
+        headers.insert("X-Another-Header".to_string(), "another-value".to_string());
+
+        let config = OpenTelemetryConfig {
+            endpoint: "http://localhost:4318".to_string(),
+            request: RequestConfig {
+                headers,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let validated_headers =
+            validate_opentelemetry_headers(&config.request.headers, config.auth.is_some()).unwrap();
+
+        let service_builder = OtlpServiceRequestBuilder {
+            auth: config.auth.clone(),
+            method: config.http.method,
+            compression: config.http.compression.clone(),
+            encoding: config.http.encoding,
+            headers: validated_headers,
+        };
+
+        assert_eq!(service_builder.headers.len(), 2);
+
+        let custom_header = HeaderName::from_static("x-custom-header");
+        let another_header = HeaderName::from_static("x-another-header");
+
+        assert!(service_builder.headers.contains_key(&custom_header));
+        assert!(service_builder.headers.contains_key(&another_header));
+
+        assert_eq!(
+            service_builder
+                .headers
+                .get(&custom_header)
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "custom-value"
+        );
+        assert_eq!(
+            service_builder
+                .headers
+                .get(&another_header)
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "another-value"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_auth_header_conflict_validation() {
+        let mut headers = IndexMap::new();
+        headers.insert("Authorization".to_string(), "Bearer token123".to_string());
+
+        let config = OpenTelemetryConfig {
+            endpoint: "http://localhost:4318".to_string(),
+            auth: Some(Auth::Bearer {
+                token: "secret-token".to_string().into(),
+            }),
+            request: RequestConfig {
+                headers,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        // This should fail validation
+        let result = validate_opentelemetry_headers(&config.request.headers, config.auth.is_some());
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("Authorization header cannot be used with defined auth options"));
+    }
+
+    #[tokio::test]
+    async fn test_auth_header_without_auth_config_is_valid() {
+        let mut headers = IndexMap::new();
+        headers.insert("Authorization".to_string(), "Bearer token123".to_string());
+
+        let config = OpenTelemetryConfig {
+            endpoint: "http://localhost:4318".to_string(),
+            auth: None,
+            request: RequestConfig {
+                headers,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        // This should pass validation since no auth config is set
+        let result = validate_opentelemetry_headers(&config.request.headers, config.auth.is_some());
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_sink_build_with_custom_headers() {
+        let mut headers = IndexMap::new();
+        headers.insert("X-Custom-Header".to_string(), "test-value".to_string());
+
+        let config = OpenTelemetryConfig {
+            endpoint: "http://localhost:4318".to_string(),
+            request: RequestConfig {
+                headers,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        // This should build successfully with custom headers
+        let validated_headers =
+            validate_opentelemetry_headers(&config.request.headers, config.auth.is_some());
+        assert!(validated_headers.is_ok());
+
+        let headers = validated_headers.unwrap();
+        assert_eq!(headers.len(), 1);
+
+        let custom_header = http::HeaderName::from_static("x-custom-header");
+        assert!(headers.contains_key(&custom_header));
+    }
+
+    #[tokio::test]
+    async fn test_header_case_normalization() {
+        let mut headers = IndexMap::new();
+        headers.insert("X-Custom-Header".to_string(), "test-value".to_string());
+        headers.insert("ANOTHER-HEADER".to_string(), "another-value".to_string());
+
+        let validated_headers = validate_opentelemetry_headers(&headers, false).unwrap();
+
+        // Header names should be normalized to lowercase
+        let custom_header = http::HeaderName::from_static("x-custom-header");
+        let another_header = http::HeaderName::from_static("another-header");
+
+        assert!(validated_headers.contains_key(&custom_header));
+        assert!(validated_headers.contains_key(&another_header));
+
+        // Verify values are preserved
+        assert_eq!(
+            validated_headers
+                .get(&custom_header)
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "test-value"
+        );
+        assert_eq!(
+            validated_headers
+                .get(&another_header)
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "another-value"
+        );
     }
 }

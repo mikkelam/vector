@@ -1,7 +1,8 @@
 //! Service implementation for the `opentelemetry` sink.
 
 use bytes::Bytes;
-use http::{header::CONTENT_TYPE, Method, Request, Uri};
+use http::{header::CONTENT_TYPE, HeaderName, HeaderValue, Method, Request, Uri};
+use indexmap::IndexMap;
 
 use crate::{
     http::Auth,
@@ -26,6 +27,7 @@ pub(super) struct OtlpServiceRequestBuilder {
     pub(super) method: HttpMethod,
     pub(super) compression: Compression,
     pub(super) encoding: ContentEncoding,
+    pub(super) headers: IndexMap<HeaderName, HeaderValue>,
 }
 
 impl HttpServiceRequestBuilder<PartitionKey> for OtlpServiceRequestBuilder {
@@ -66,6 +68,13 @@ impl HttpServiceRequestBuilder<PartitionKey> for OtlpServiceRequestBuilder {
         let mut http_request = builder
             .body(request.take_payload())
             .map_err(|err| crate::Error::from(format!("Failed to build HTTP request: {}", err)))?;
+
+        // Apply custom headers from request config
+        for (name, value) in &self.headers {
+            http_request
+                .headers_mut()
+                .insert(name.clone(), value.clone());
+        }
 
         if let Some(auth) = &self.auth {
             auth.apply(&mut http_request);
