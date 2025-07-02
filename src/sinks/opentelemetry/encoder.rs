@@ -45,12 +45,191 @@ use crate::{
 
 use super::config::OtlpConfig;
 
+/// Trait for extracting and removing resource attributes from events
+trait ResourceAttributeExtractor {
+    fn extract_resource_attributes(&mut self) -> Vec<KeyValue>;
+    fn remove_resource_attributes(&mut self);
+
+    /// Extract all resource attributes (both nested and flattened formats)
+    fn extract_all_resource_attributes(&mut self) -> Vec<KeyValue> {
+        let mut resource_attributes = Vec::new();
+
+        // Try nested format first (if supported by event type)
+        resource_attributes.extend(self.extract_nested_resource_attributes());
+
+        // Then extract flattened fields for Vector OTLP source compatibility
+        resource_attributes.extend(self.extract_resource_attributes());
+
+        resource_attributes
+    }
+
+    /// Remove all resource attributes (both nested and flattened formats)
+    fn remove_all_resource_attributes(&mut self) {
+        self.remove_nested_resource_attributes();
+        self.remove_resource_attributes();
+    }
+
+    /// Extract nested resource attributes (default: empty, override for logs/traces)
+    fn extract_nested_resource_attributes(&mut self) -> Vec<KeyValue> {
+        Vec::new()
+    }
+
+    /// Remove nested resource attributes (default: no-op, override for logs/traces)
+    fn remove_nested_resource_attributes(&mut self) {
+        // Default implementation does nothing
+    }
+}
+
+impl ResourceAttributeExtractor for LogEvent {
+    fn extract_resource_attributes(&mut self) -> Vec<KeyValue> {
+        let mut resource_attributes = Vec::new();
+        let mut keys_to_remove = Vec::new();
+
+        for (key, value) in self.all_event_fields().unwrap() {
+            if let Some(attr_key) = key.strip_prefix("resources.") {
+                let clean_key = attr_key.trim_matches('"');
+                resource_attributes.push(KeyValue {
+                    key: clean_key.to_string(),
+                    value: Some(convert_value_to_any_value(value.clone())),
+                });
+                keys_to_remove.push(key.clone());
+            }
+        }
+
+        for key in &keys_to_remove {
+            self.remove(key.as_str());
+        }
+
+        resource_attributes
+    }
+
+    fn remove_resource_attributes(&mut self) {
+        let mut keys_to_remove = Vec::new();
+
+        for (key, _) in self.all_event_fields().unwrap() {
+            if key.starts_with("resources.") {
+                keys_to_remove.push(key.clone());
+            }
+        }
+
+        for key in &keys_to_remove {
+            self.remove(key.as_str());
+        }
+    }
+
+    fn extract_nested_resource_attributes(&mut self) -> Vec<KeyValue> {
+        if let Some(resource_map) = self.remove(event_path!("resource")) {
+            if let Some(resource_obj) = resource_map.as_object() {
+                return convert_object_map_to_key_value_vec(resource_obj.clone());
+            }
+        }
+        Vec::new()
+    }
+
+    fn remove_nested_resource_attributes(&mut self) {
+        let _ = self.remove(event_path!("resource"));
+    }
+}
+
+impl ResourceAttributeExtractor for VectorMetric {
+    fn extract_resource_attributes(&mut self) -> Vec<KeyValue> {
+        let mut resource_attributes = Vec::new();
+        let mut keys_to_remove = Vec::new();
+
+        if let Some(tags) = self.tags_mut() {
+            for (key, value) in tags.iter_single() {
+                if let Some(attr_key) = key.strip_prefix("resources.") {
+                    let clean_key = attr_key.trim_matches('"');
+                    resource_attributes.push(KeyValue {
+                        key: clean_key.to_string(),
+                        value: Some(convert_value_to_any_value(Value::from(value.to_string()))),
+                    });
+                    keys_to_remove.push(key.to_string());
+                }
+            }
+
+            for key in &keys_to_remove {
+                tags.remove(key);
+            }
+        }
+
+        resource_attributes
+    }
+
+    fn remove_resource_attributes(&mut self) {
+        let mut keys_to_remove = Vec::new();
+
+        if let Some(tags) = self.tags_mut() {
+            for key in tags.keys() {
+                if key.starts_with("resources.") {
+                    keys_to_remove.push(key.to_string());
+                }
+            }
+
+            for key in &keys_to_remove {
+                tags.remove(&key);
+            }
+        }
+    }
+}
+
+impl ResourceAttributeExtractor for TraceEvent {
+    fn extract_resource_attributes(&mut self) -> Vec<KeyValue> {
+        let mut resource_attributes = Vec::new();
+        let mut keys_to_remove = Vec::new();
+
+        for (key_path, value) in self.as_map().iter() {
+            let key = key_path.to_string();
+            if let Some(attr_key) = key.strip_prefix("resources.") {
+                let clean_key = attr_key.trim_matches('"');
+                resource_attributes.push(KeyValue {
+                    key: clean_key.to_string(),
+                    value: Some(convert_value_to_any_value(value.clone())),
+                });
+                keys_to_remove.push(key);
+            }
+        }
+
+        for key in &keys_to_remove {
+            self.remove(key.as_str());
+        }
+
+        resource_attributes
+    }
+
+    fn remove_resource_attributes(&mut self) {
+        let mut keys_to_remove = Vec::new();
+
+        for (key_path, _) in self.as_map().iter() {
+            let key = key_path.to_string();
+            if key.starts_with("resources.") {
+                keys_to_remove.push(key);
+            }
+        }
+
+        for key in &keys_to_remove {
+            self.remove(key.as_str());
+        }
+    }
+
+    fn extract_nested_resource_attributes(&mut self) -> Vec<KeyValue> {
+        if let Some(resource_map) = self.remove(event_path!("resource")) {
+            if let Some(resource_obj) = resource_map.as_object() {
+                return convert_object_map_to_key_value_vec(resource_obj.clone());
+            }
+        }
+        Vec::new()
+    }
+
+    fn remove_nested_resource_attributes(&mut self) {
+        let _ = self.remove(event_path!("resource"));
+    }
+}
+
 /// The encoder for OTLP, responsible for converting batches of events
 /// into Protobuf byte payloads.
 #[derive(Debug, Clone)]
-pub(super) struct OtlpEncoder {
-    otlp_config: OtlpConfig,
-}
+pub(super) struct OtlpEncoder {}
 
 /// Normalizer that converts all metrics to absolute (cumulative) values
 /// This follows Vector's standard pattern used by Prometheus and other sinks
@@ -67,47 +246,36 @@ impl MetricNormalize for OtlpMetricNormalize {
 
 impl OtlpEncoder {
     /// Creates a new `OtlpEncoder`.
-    pub(super) const fn new(otlp_config: OtlpConfig) -> Self {
-        Self { otlp_config }
+    pub(super) const fn new(_otlp_config: OtlpConfig) -> Self {
+        Self {}
     }
 
     /// Encodes a batch of log events into an `ExportLogsServiceRequest` Protobuf message.
     pub fn encode_logs(&self, events: Vec<Event>) -> Result<Bytes, ()> {
-        // For simplicity, put all logs in a single ResourceLogs with merged resource attributes
         let mut log_records = Vec::new();
-        let mut event_resource_attributes = Vec::new();
+        let mut resource_attributes = Vec::new();
 
-        for event in events {
+        for (index, event) in events.into_iter().enumerate() {
             let mut log = event.into_log();
 
-            // Extract resource attributes from both nested and flattened formats
-            if event_resource_attributes.is_empty() {
-                // First try nested format (for existing tests)
-                if let Some(resource_map) = log.remove(event_path!("resource")) {
-                    if let Some(resource_obj) = resource_map.as_object() {
-                        event_resource_attributes =
-                            convert_object_map_to_key_value_vec(resource_obj.clone());
-                    }
-                }
-                // Then extract any flattened fields (for Vector OTLP source)
-                let flattened_attrs = self.extract_resource_attributes(&mut log);
-                event_resource_attributes.extend(flattened_attrs);
+            // Extract resource from first event only to avoid duplication
+            if index == 0 {
+                resource_attributes = log.extract_all_resource_attributes();
             } else {
-                // Remove resource attributes from subsequent events to avoid duplication
-                let _ = log.remove(event_path!("resource"));
-                self.remove_resource_attributes(&mut log);
+                log.remove_all_resource_attributes();
             }
 
             let log_record = self.convert_log_event_to_log_record(log);
             log_records.push(log_record);
         }
 
-        let resource_attributes = self.merge_resource_attributes(event_resource_attributes);
-
         let scope_logs = vec![self.create_scope_logs(log_records)];
 
         let resource_logs = vec![ResourceLogs {
-            resource: Some(self.create_resource(resource_attributes)),
+            resource: Some(Resource {
+                attributes: resource_attributes,
+                dropped_attributes_count: 0,
+            }),
             scope_logs,
             schema_url: String::new(),
         }];
@@ -210,13 +378,21 @@ impl OtlpEncoder {
     /// Encodes a batch of metric events into an `ExportMetricsServiceRequest` Protobuf message.
     pub(super) fn encode_metrics(&self, events: Vec<Event>) -> Result<Bytes, ()> {
         let mut metric_records = Vec::new();
+        let mut resource_attributes = Vec::new();
 
         // Normalize metrics to absolute (cumulative) values for consistent OTLP semantics
         let mut normalizer = OtlpMetricNormalize::default();
         let mut metric_state = MetricSet::default();
 
-        for event in events {
-            let metric = event.into_metric();
+        for (index, event) in events.into_iter().enumerate() {
+            let mut metric = event.into_metric();
+
+            // Extract resource from first event only to avoid duplication
+            if index == 0 {
+                resource_attributes = metric.extract_all_resource_attributes();
+            } else {
+                metric.remove_all_resource_attributes();
+            }
 
             // Apply normalization to convert incremental metrics to absolute
             if let Some(normalized_metric) = normalizer.normalize(&mut metric_state, metric) {
@@ -225,13 +401,13 @@ impl OtlpEncoder {
             }
         }
 
-        // For metrics, we use the global config resource attributes to identify the Vector instance
-        let resource_attributes = self.merge_resource_attributes(Vec::new());
-
         let scope_metrics = vec![self.create_scope_metrics(metric_records)];
 
         let resource_metrics = vec![ResourceMetrics {
-            resource: Some(self.create_resource(resource_attributes)),
+            resource: Some(Resource {
+                attributes: resource_attributes,
+                dropped_attributes_count: 0,
+            }),
             scope_metrics,
             schema_url: String::new(),
         }];
@@ -242,21 +418,30 @@ impl OtlpEncoder {
     }
 
     pub fn encode_traces(&self, events: Vec<Event>) -> Result<Bytes, ()> {
-        let mut span_records = Vec::new();
+        let mut spans = Vec::new();
+        let mut resource_attributes = Vec::new();
 
-        for event in events {
-            let trace = event.into_trace();
-            let otlp_span = convert_vector_trace_to_otlp_span(trace);
-            span_records.push(otlp_span);
+        for (index, event) in events.into_iter().enumerate() {
+            let mut trace = event.into_trace();
+
+            // Extract resource from first event only to avoid duplication
+            if index == 0 {
+                resource_attributes = trace.extract_all_resource_attributes();
+            } else {
+                trace.remove_all_resource_attributes();
+            }
+
+            let span = convert_vector_trace_to_otlp_span(trace);
+            spans.push(span);
         }
 
-        // For traces, we use the global config resource attributes to identify the Vector instance
-        let resource_attributes = self.merge_resource_attributes(Vec::new());
-
-        let scope_spans = vec![self.create_scope_spans(span_records)];
+        let scope_spans = vec![self.create_scope_spans(spans)];
 
         let resource_spans = vec![ResourceSpans {
-            resource: Some(self.create_resource(resource_attributes)),
+            resource: Some(Resource {
+                attributes: resource_attributes,
+                dropped_attributes_count: 0,
+            }),
             scope_spans,
             schema_url: String::new(),
         }];
@@ -266,140 +451,27 @@ impl OtlpEncoder {
         Ok(request.encode_to_vec().into())
     }
 
-    /// Creates a Resource with the given attributes.
-    fn create_resource(&self, attributes: Vec<KeyValue>) -> Resource {
-        Resource {
-            attributes,
-            dropped_attributes_count: 0,
-        }
-    }
-
-    /// Creates a ScopeLogs with the given log records.
     fn create_scope_logs(&self, log_records: Vec<LogRecord>) -> ScopeLogs {
         ScopeLogs {
-            scope: None, // Vector acts as a transparent aggregator/router
+            scope: None,
             log_records,
             schema_url: String::new(),
         }
     }
 
-    /// Creates a ScopeMetrics with the given metrics.
     fn create_scope_metrics(&self, metrics: Vec<OtlpMetric>) -> ScopeMetrics {
         ScopeMetrics {
-            scope: None, // Vector acts as a transparent aggregator/router
+            scope: None,
             metrics,
             schema_url: String::new(),
         }
     }
 
-    /// Creates a ScopeSpans with the given spans.
     fn create_scope_spans(&self, spans: Vec<Span>) -> ScopeSpans {
         ScopeSpans {
-            scope: None, // Vector acts as a transparent aggregator/router
+            scope: None,
             spans,
             schema_url: String::new(),
-        }
-    }
-
-    /// Merges event-level resource attributes with global configuration attributes.
-    ///
-    /// Global config attributes take precedence over event attributes for consistency.
-    fn merge_resource_attributes(&self, event_attributes: Vec<KeyValue>) -> Vec<KeyValue> {
-        let mut merged_attributes = event_attributes;
-
-        // Add global resource attributes from config
-        for (key, value) in &self.otlp_config.resource_attributes {
-            // Check if this key already exists in event attributes
-            let key_exists = merged_attributes.iter().any(|kv| kv.key == *key);
-
-            if !key_exists {
-                merged_attributes.push(KeyValue {
-                    key: key.clone(),
-                    value: Some(AnyValue {
-                        value: Some(PbValue::StringValue(value.clone())),
-                    }),
-                });
-            }
-        }
-
-        // Add service name if configured and not already present
-        if let Some(service_name) = &self.otlp_config.service_name {
-            let service_name_exists = merged_attributes.iter().any(|kv| kv.key == "service.name");
-            if !service_name_exists {
-                merged_attributes.push(KeyValue {
-                    key: "service.name".to_string(),
-                    value: Some(AnyValue {
-                        value: Some(PbValue::StringValue(service_name.clone())),
-                    }),
-                });
-            }
-        }
-
-        // Add service version if configured and not already present
-        if let Some(service_version) = &self.otlp_config.service_version {
-            let service_version_exists = merged_attributes
-                .iter()
-                .any(|kv| kv.key == "service.version");
-            if !service_version_exists {
-                merged_attributes.push(KeyValue {
-                    key: "service.version".to_string(),
-                    value: Some(AnyValue {
-                        value: Some(PbValue::StringValue(service_version.clone())),
-                    }),
-                });
-            }
-        }
-
-        merged_attributes
-    }
-
-    /// Extracts resource attributes from flattened fields with "resources." prefix.
-    fn extract_resource_attributes(&self, log: &mut LogEvent) -> Vec<KeyValue> {
-        let mut resource_attributes = Vec::new();
-        let mut keys_to_remove = Vec::new();
-
-        // Collect all fields that start with "resources."
-        for (key, value) in log.all_event_fields().unwrap() {
-            if let Some(attr_key) = key.strip_prefix("resources.") {
-                // Remove surrounding quotes if present
-                let clean_key = attr_key.trim_matches('"');
-                resource_attributes.push(KeyValue {
-                    key: clean_key.to_string(),
-                    value: Some(convert_value_to_any_value(value.clone())),
-                });
-                keys_to_remove.push(key.clone());
-            }
-        }
-
-        // Remove the flattened resource fields from the log
-        for key in &keys_to_remove {
-            log.remove(key.as_str());
-        }
-
-        // Clean up empty parent objects that may have been left behind
-        if log
-            .get("resources")
-            .and_then(|v| v.as_object())
-            .map_or(false, |obj| obj.is_empty())
-        {
-            log.remove("resources");
-        }
-
-        resource_attributes
-    }
-
-    /// Removes resource attributes from log event (for subsequent events in batch).
-    fn remove_resource_attributes(&self, log: &mut LogEvent) {
-        let mut keys_to_remove = Vec::new();
-
-        for (key, _) in log.all_event_fields().unwrap() {
-            if key.starts_with("resources.") {
-                keys_to_remove.push(key.clone());
-            }
-        }
-
-        for key in keys_to_remove {
-            log.remove(key.as_str());
         }
     }
 
@@ -1022,20 +1094,41 @@ fn convert_vector_trace_to_otlp_span(trace: TraceEvent) -> Span {
         .map(|s| s.to_string())
         .unwrap_or_else(|| "".to_string());
 
-    // Calculate timestamps from Vector's timestamp and duration_ns
-    let end_time_unix_nano = trace_map
+    // Handle timestamps - either direct fields or calculated from timestamp/duration
+    let end_time_unix_nano = if let Some(end_time) =
+        trace_map.get("end_time_unix_nano").and_then(|v| {
+            if let Some(ts) = v.as_timestamp() {
+                ts.timestamp_nanos_opt()
+            } else {
+                v.as_integer()
+            }
+        }) {
+        end_time as u64
+    } else if let Some(timestamp) = trace_map
         .get("timestamp")
         .and_then(|v| v.as_timestamp())
         .and_then(|ts| ts.timestamp_nanos_opt())
-        .unwrap_or(0) as u64;
+    {
+        timestamp as u64
+    } else {
+        0
+    };
 
-    let duration_ns = trace_map
-        .get("duration_ns")
-        .and_then(|v| v.as_integer())
-        .unwrap_or(0) as u64;
-
-    let start_time_unix_nano = if end_time_unix_nano > 0 && duration_ns > 0 {
-        end_time_unix_nano.saturating_sub(duration_ns)
+    let start_time_unix_nano = if let Some(start_time) =
+        trace_map.get("start_time_unix_nano").and_then(|v| {
+            if let Some(ts) = v.as_timestamp() {
+                ts.timestamp_nanos_opt()
+            } else {
+                v.as_integer()
+            }
+        }) {
+        start_time as u64
+    } else if end_time_unix_nano > 0 {
+        if let Some(duration_ns) = trace_map.get("duration_ns").and_then(|v| v.as_integer()) {
+            end_time_unix_nano.saturating_sub(duration_ns as u64)
+        } else {
+            0
+        }
     } else {
         0
     };
@@ -1045,28 +1138,31 @@ fn convert_vector_trace_to_otlp_span(trace: TraceEvent) -> Span {
     let mut status_code = 1; // OK = 1
     let mut status_message = String::new();
 
-    if let Some(tags) = trace_map.get("tags").and_then(|v| v.as_object()) {
-        for (key, value) in tags {
-            match key.as_str() {
-                "otel.status_code" => {
-                    if let Some(code_str) = value.as_str() {
-                        status_code = match code_str.to_lowercase().as_str() {
-                            "error" => 2, // ERROR = 2
-                            "ok" => 1,    // OK = 1
-                            _ => 0,       // UNSET = 0
-                        };
+    // Process both tags and attributes fields
+    for field_name in ["tags", "attributes"] {
+        if let Some(attrs) = trace_map.get(field_name).and_then(|v| v.as_object()) {
+            for (key, value) in attrs {
+                match key.as_str() {
+                    "otel.status_code" => {
+                        if let Some(code_str) = value.as_str() {
+                            status_code = match code_str.to_lowercase().as_str() {
+                                "error" => 2, // ERROR = 2
+                                "ok" => 1,    // OK = 1
+                                _ => 0,       // UNSET = 0
+                            };
+                        }
                     }
-                }
-                "error" => {
-                    if let Some(msg) = value.as_str() {
-                        status_message = msg.to_string();
+                    "error" => {
+                        if let Some(msg) = value.as_str() {
+                            status_message = msg.to_string();
+                        }
                     }
-                }
-                _ => {
-                    attributes.push(KeyValue {
-                        key: key.to_string(),
-                        value: Some(convert_value_to_any_value(value.clone())),
-                    });
+                    _ => {
+                        attributes.push(KeyValue {
+                            key: key.to_string(),
+                            value: Some(convert_value_to_any_value(value.clone())),
+                        });
+                    }
                 }
             }
         }
@@ -1147,10 +1243,14 @@ fn convert_value_to_span_event(value: &Value) -> Option<SpanEvent> {
     let obj = value.as_object()?;
 
     let name = obj.get("name")?.as_str()?.to_string();
-    let time_unix_nano = obj
-        .get("timestamp")?
-        .as_timestamp()?
-        .timestamp_nanos_opt()? as u64;
+    let time_unix_nano =
+        if let Some(timestamp) = obj.get("timestamp").and_then(|v| v.as_timestamp()) {
+            timestamp.timestamp_nanos_opt().unwrap_or(0) as u64
+        } else if let Some(time_nano) = obj.get("time_unix_nano").and_then(|v| v.as_integer()) {
+            time_nano as u64
+        } else {
+            0
+        };
 
     let attributes = obj
         .get("attributes")
@@ -1853,6 +1953,406 @@ mod tests {
             assert_eq!(data_point.bucket_counts, vec![5, 10, 2]);
         } else {
             panic!("Expected histogram to have Histogram data");
+        }
+    }
+
+    #[test]
+    fn test_metric_resource_extraction() {
+        use prost::Message;
+
+        use vector_lib::opentelemetry::proto::collector::metrics::v1::ExportMetricsServiceRequest;
+
+        let encoder = OtlpEncoder::new(OtlpConfig::default());
+
+        // Create metric with flattened resource attributes
+        let mut metric = VectorMetric::new(
+            "test_counter",
+            crate::event::metric::MetricKind::Incremental,
+            crate::event::metric::MetricValue::Counter { value: 1.0 },
+        );
+
+        // Add resource attributes as tags with "resources." prefix
+        let mut tags = crate::event::metric::MetricTags::default();
+        tags.replace(
+            "resources.\"service.name\"".to_string(),
+            "test-service".to_string(),
+        );
+        tags.replace(
+            "resources.\"deployment.environment\"".to_string(),
+            "production".to_string(),
+        );
+        tags.replace(
+            "resources.\"host.name\"".to_string(),
+            "test-host".to_string(),
+        );
+        tags.replace("normal.tag".to_string(), "normal-value".to_string());
+        metric = metric.with_tags(Some(tags));
+
+        let events = vec![Event::Metric(metric)];
+        let result = encoder.encode_metrics(events).unwrap();
+
+        // Decode and verify resource attributes are extracted
+        let request = ExportMetricsServiceRequest::decode(result.as_ref()).unwrap();
+        let resource_metrics = &request.resource_metrics[0];
+        let resource = resource_metrics.resource.as_ref().unwrap();
+
+        let resource_attrs: std::collections::HashMap<String, String> = resource
+            .attributes
+            .iter()
+            .map(|kv| {
+                let value = kv.value.as_ref().unwrap().value.as_ref().unwrap();
+                if let vector_lib::opentelemetry::proto::common::v1::any_value::Value::StringValue(
+                    s,
+                ) = value
+                {
+                    (kv.key.clone(), s.clone())
+                } else {
+                    (kv.key.clone(), "".to_string())
+                }
+            })
+            .collect();
+
+        // Verify resource attributes were extracted
+        assert_eq!(
+            resource_attrs.get("service.name"),
+            Some(&"test-service".to_string())
+        );
+        assert_eq!(
+            resource_attrs.get("deployment.environment"),
+            Some(&"production".to_string())
+        );
+        assert_eq!(
+            resource_attrs.get("host.name"),
+            Some(&"test-host".to_string())
+        );
+
+        // Verify normal tags were not extracted as resource attributes
+        assert!(!resource_attrs.contains_key("normal.tag"));
+    }
+
+    #[test]
+    fn test_trace_resource_extraction() {
+        use prost::Message;
+        use vector_lib::event::EventMetadata;
+
+        use vector_lib::opentelemetry::proto::collector::trace::v1::ExportTraceServiceRequest;
+
+        let encoder = OtlpEncoder::new(OtlpConfig::default());
+
+        // Create trace with flattened resource attributes
+        let mut trace_fields = ObjectMap::new();
+        trace_fields.insert("trace_id".into(), Value::from("test_trace_id"));
+        trace_fields.insert("span_id".into(), Value::from("test_span_id"));
+        trace_fields.insert("name".into(), Value::from("test_span"));
+
+        // Add resource attributes with "resources." prefix
+        trace_fields.insert(
+            "resources.\"service.name\"".into(),
+            Value::from("trace-service"),
+        );
+        trace_fields.insert("resources.\"service.version\"".into(), Value::from("1.0.0"));
+        trace_fields.insert(
+            "resources.\"k8s.cluster\"".into(),
+            Value::from("test-cluster"),
+        );
+
+        let trace_event = Event::Trace(TraceEvent::from_parts(
+            trace_fields,
+            EventMetadata::default(),
+        ));
+
+        let events = vec![trace_event];
+        let result = encoder.encode_traces(events).unwrap();
+
+        // Decode and verify resource attributes are extracted
+        let request = ExportTraceServiceRequest::decode(result.as_ref()).unwrap();
+        let resource_spans = &request.resource_spans[0];
+        let resource = resource_spans.resource.as_ref().unwrap();
+
+        let resource_attrs: std::collections::HashMap<String, String> = resource
+            .attributes
+            .iter()
+            .map(|kv| {
+                let value = kv.value.as_ref().unwrap().value.as_ref().unwrap();
+                if let vector_lib::opentelemetry::proto::common::v1::any_value::Value::StringValue(
+                    s,
+                ) = value
+                {
+                    (kv.key.clone(), s.clone())
+                } else {
+                    (kv.key.clone(), "".to_string())
+                }
+            })
+            .collect();
+
+        // Verify resource attributes were extracted
+        assert_eq!(
+            resource_attrs.get("service.name"),
+            Some(&"trace-service".to_string())
+        );
+        assert_eq!(
+            resource_attrs.get("service.version"),
+            Some(&"1.0.0".to_string())
+        );
+        assert_eq!(
+            resource_attrs.get("k8s.cluster"),
+            Some(&"test-cluster".to_string())
+        );
+    }
+
+    #[test]
+    fn test_resource_attribute_extractor_trait_logs() {
+        // Test the trait methods directly on LogEvent
+        let mut log = LogEvent::from("test message");
+        log.insert("resources.\"service.name\"", "test-service");
+        log.insert("resources.environment", "production");
+        log.insert("normal_field", "normal_value");
+
+        // Test extraction
+        let resource_attrs = log.extract_resource_attributes();
+        assert_eq!(resource_attrs.len(), 2);
+
+        let service_name = resource_attrs
+            .iter()
+            .find(|attr| attr.key == "service.name")
+            .unwrap();
+        if let Some(any_value) = &service_name.value {
+            if let Some(PbValue::StringValue(s)) = &any_value.value {
+                assert_eq!(s, "test-service");
+            }
+        }
+
+        // Verify resource fields were removed
+        assert!(log.get("resources.\"service.name\"").is_none());
+        assert!(log.get("resources.environment").is_none());
+        // Normal field should remain
+        assert!(log.get("normal_field").is_some());
+    }
+
+    #[test]
+    fn test_resource_attribute_extractor_trait_metrics() {
+        // Test the trait methods directly on VectorMetric
+        let mut metric = VectorMetric::new(
+            "test_metric",
+            crate::event::metric::MetricKind::Absolute,
+            crate::event::metric::MetricValue::Counter { value: 1.0 },
+        );
+
+        let mut tags = crate::event::metric::MetricTags::default();
+        tags.replace(
+            "resources.service.name".to_string(),
+            "metric-service".to_string(),
+        );
+        tags.replace("resources.version".to_string(), "2.0.0".to_string());
+        tags.replace("normal_tag".to_string(), "normal_value".to_string());
+        metric = metric.with_tags(Some(tags));
+
+        // Test extraction
+        let resource_attrs = metric.extract_resource_attributes();
+        assert_eq!(resource_attrs.len(), 2);
+
+        let service_name = resource_attrs
+            .iter()
+            .find(|attr| attr.key == "service.name")
+            .unwrap();
+        if let Some(any_value) = &service_name.value {
+            if let Some(PbValue::StringValue(s)) = &any_value.value {
+                assert_eq!(s, "metric-service");
+            }
+        }
+
+        // Verify resource tags were removed
+        if let Some(tags) = metric.tags() {
+            assert!(!tags.contains_key("resources.service.name"));
+            assert!(!tags.contains_key("resources.version"));
+            assert!(tags.contains_key("normal_tag"));
+        }
+    }
+
+    #[test]
+    fn test_resource_attribute_extractor_trait_traces() {
+        // Test the trait methods directly on TraceEvent
+        let mut trace_fields = ObjectMap::new();
+        trace_fields.insert("trace_id".into(), Value::from("test_trace"));
+        trace_fields.insert(
+            "resources.service.name".into(),
+            Value::from("trace-service"),
+        );
+        trace_fields.insert("resources.cluster".into(), Value::from("test-cluster"));
+        trace_fields.insert("span_name".into(), Value::from("test-span"));
+
+        let mut trace_event =
+            TraceEvent::from_parts(trace_fields, vector_lib::event::EventMetadata::default());
+
+        // Test extraction
+        let resource_attrs = trace_event.extract_resource_attributes();
+        assert_eq!(resource_attrs.len(), 2);
+
+        let service_name = resource_attrs
+            .iter()
+            .find(|attr| attr.key == "service.name")
+            .unwrap();
+        if let Some(any_value) = &service_name.value {
+            if let Some(PbValue::StringValue(s)) = &any_value.value {
+                assert_eq!(s, "trace-service");
+            }
+        }
+
+        // Verify resource fields were removed
+        assert!(trace_event.get("resources.service.name").is_none());
+        assert!(trace_event.get("resources.cluster").is_none());
+        // Normal field should remain
+        assert!(trace_event.get("span_name").is_some());
+    }
+
+    #[test]
+    fn test_resource_attribute_removal_only() {
+        // Test removal without extraction for logs
+        let mut log = LogEvent::from("test message");
+        log.insert("resources.service", "test");
+        log.insert("resources.environment", "prod");
+        log.insert("keep_me", "value");
+
+        log.remove_resource_attributes();
+
+        assert!(log.get("resources.service").is_none());
+        assert!(log.get("resources.environment").is_none());
+        assert!(log.get("keep_me").is_some());
+
+        // Test removal for metrics
+        let mut metric = VectorMetric::new(
+            "test_metric",
+            crate::event::metric::MetricKind::Absolute,
+            crate::event::metric::MetricValue::Counter { value: 1.0 },
+        );
+
+        let mut tags = crate::event::metric::MetricTags::default();
+        tags.replace("resources.service".to_string(), "test".to_string());
+        tags.replace("keep_tag".to_string(), "value".to_string());
+        metric = metric.with_tags(Some(tags));
+
+        metric.remove_resource_attributes();
+
+        if let Some(tags) = metric.tags() {
+            assert!(!tags.contains_key("resources.service"));
+            assert!(tags.contains_key("keep_tag"));
+        }
+    }
+
+    #[test]
+    fn test_resource_attribute_edge_cases() {
+        // Test empty resource attributes
+        let mut log = LogEvent::from("test");
+        let attrs = log.extract_resource_attributes();
+        assert_eq!(attrs.len(), 0);
+
+        // Test metric without tags
+        let mut metric = VectorMetric::new(
+            "test",
+            crate::event::metric::MetricKind::Absolute,
+            crate::event::metric::MetricValue::Counter { value: 1.0 },
+        );
+        let attrs = metric.extract_resource_attributes();
+        assert_eq!(attrs.len(), 0);
+
+        // Test partial "resources" prefix (should not match)
+        let mut log = LogEvent::from("test");
+        log.insert("resource", "not-extracted");
+        log.insert("resources", "also-not-extracted");
+        let attrs = log.extract_resource_attributes();
+        assert_eq!(attrs.len(), 0);
+        assert!(log.get("resource").is_some());
+        assert!(log.get("resources").is_some());
+    }
+
+    #[test]
+    fn test_extract_all_resource_attributes() {
+        // Test logs with both nested and flattened resource attributes
+        let mut log = LogEvent::from("test message");
+
+        // Add nested resource attributes
+        let mut nested_resource = ObjectMap::new();
+        nested_resource.insert("service.name".into(), Value::from("nested-service"));
+        nested_resource.insert("version".into(), Value::from("1.0.0"));
+        log.insert(event_path!("resource"), Value::Object(nested_resource));
+
+        // Add flattened resource attributes
+        log.insert("resources.environment", "production");
+        log.insert("resources.cluster", "us-west-1");
+        log.insert("normal_field", "keep_me");
+
+        // Extract all resource attributes
+        let all_attrs = log.extract_all_resource_attributes();
+
+        // Should have 4 total attributes (2 nested + 2 flattened)
+        assert_eq!(all_attrs.len(), 4);
+
+        // Verify nested attributes were extracted
+        let service_name = all_attrs
+            .iter()
+            .find(|attr| attr.key == "service.name")
+            .unwrap();
+        if let Some(any_value) = &service_name.value {
+            if let Some(PbValue::StringValue(s)) = &any_value.value {
+                assert_eq!(s, "nested-service");
+            }
+        }
+
+        // Verify flattened attributes were extracted
+        let environment = all_attrs
+            .iter()
+            .find(|attr| attr.key == "environment")
+            .unwrap();
+        if let Some(any_value) = &environment.value {
+            if let Some(PbValue::StringValue(s)) = &any_value.value {
+                assert_eq!(s, "production");
+            }
+        }
+
+        // Verify both nested and flattened resources were removed
+        assert!(log.get(event_path!("resource")).is_none());
+        assert!(log.get("resources.environment").is_none());
+        assert!(log.get("resources.cluster").is_none());
+
+        // Normal field should remain
+        assert!(log.get("normal_field").is_some());
+    }
+
+    #[test]
+    fn test_remove_all_resource_attributes() {
+        // Test comprehensive removal for logs
+        let mut log = LogEvent::from("test message");
+
+        // Add both formats
+        let mut nested_resource = ObjectMap::new();
+        nested_resource.insert("service.name".into(), Value::from("test"));
+        log.insert(event_path!("resource"), Value::Object(nested_resource));
+        log.insert("resources.environment", "test");
+        log.insert("keep_field", "value");
+
+        log.remove_all_resource_attributes();
+
+        assert!(log.get(event_path!("resource")).is_none());
+        assert!(log.get("resources.environment").is_none());
+        assert!(log.get("keep_field").is_some());
+
+        // Test metrics (only flattened format)
+        let mut metric = VectorMetric::new(
+            "test_metric",
+            crate::event::metric::MetricKind::Absolute,
+            crate::event::metric::MetricValue::Counter { value: 1.0 },
+        );
+
+        let mut tags = crate::event::metric::MetricTags::default();
+        tags.replace("resources.service".to_string(), "test".to_string());
+        tags.replace("keep_tag".to_string(), "value".to_string());
+        metric = metric.with_tags(Some(tags));
+
+        metric.remove_all_resource_attributes();
+
+        if let Some(tags) = metric.tags() {
+            assert!(!tags.contains_key("resources.service"));
+            assert!(tags.contains_key("keep_tag"));
         }
     }
 }

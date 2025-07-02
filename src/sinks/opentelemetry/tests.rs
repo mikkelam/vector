@@ -4,13 +4,13 @@ use chrono::{TimeZone, Utc};
 use futures::stream;
 use http::{Request, Response};
 use hyper::Body;
-use indexmap::IndexMap;
+
 use prost::Message;
 use rstest::rstest;
 use std::convert::Infallible;
 use std::sync::{Arc, Mutex};
 
-use super::config::{ContentEncoding, HttpMethod, OtlpConfig, OtlpProtocol};
+use super::config::{ContentEncoding, HttpMethod, OtlpProtocol};
 use vector_lib::event::EventMetadata;
 use vrl::event_path;
 
@@ -1235,11 +1235,6 @@ fn test_default_config() {
     assert!(matches!(config.http.method, HttpMethod::Post));
     assert!(matches!(config.http.compression, Compression::None));
     assert!(matches!(config.http.encoding, ContentEncoding::Protobuf));
-
-    // Test OTLP config defaults
-    assert!(config.otlp.resource_attributes.is_empty());
-    assert!(config.otlp.service_name.is_none());
-    assert!(config.otlp.service_version.is_none());
 }
 
 #[test]
@@ -1251,14 +1246,6 @@ endpoint = "http://localhost:4318"
 method = "put"
 compression = "gzip"
 encoding = "protobuf"
-
-[otlp]
-service_name = "test-service"
-service_version = "1.0.0"
-
-[otlp.resource_attributes]
-"deployment.environment" = "staging"
-"service.namespace" = "test"
 "#;
 
     let config: OpenTelemetryConfig = toml::from_str(config_str).unwrap();
@@ -1266,53 +1253,9 @@ service_version = "1.0.0"
     assert!(matches!(config.http.method, HttpMethod::Put));
     assert!(matches!(config.http.compression, Compression::Gzip(_)));
     assert!(matches!(config.http.encoding, ContentEncoding::Protobuf));
-
-    assert_eq!(config.otlp.service_name, Some("test-service".to_string()));
-    assert_eq!(config.otlp.service_version, Some("1.0.0".to_string()));
-
-    assert_eq!(
-        config
-            .otlp
-            .resource_attributes
-            .get("deployment.environment"),
-        Some(&"staging".to_string())
-    );
-    assert_eq!(
-        config.otlp.resource_attributes.get("service.namespace"),
-        Some(&"test".to_string())
-    );
 }
 
-#[test]
-fn test_resource_attributes_config() {
-    let config_str = r#"
-endpoint = "http://localhost:4318"
-
-[otlp.resource_attributes]
-"service.name" = "my-app"
-"service.version" = "2.1.0"
-"deployment.environment" = "production"
-"k8s.cluster.name" = "prod-cluster"
-"k8s.namespace.name" = "monitoring"
-"#;
-
-    let config: OpenTelemetryConfig = toml::from_str(config_str).unwrap();
-
-    let expected_attrs: IndexMap<String, String> = [
-        ("service.name".to_string(), "my-app".to_string()),
-        ("service.version".to_string(), "2.1.0".to_string()),
-        (
-            "deployment.environment".to_string(),
-            "production".to_string(),
-        ),
-        ("k8s.cluster.name".to_string(), "prod-cluster".to_string()),
-        ("k8s.namespace.name".to_string(), "monitoring".to_string()),
-    ]
-    .into_iter()
-    .collect();
-
-    assert_eq!(config.otlp.resource_attributes, expected_attrs);
-}
+// Test removed - resource attributes are no longer supported at config level
 
 #[test]
 fn test_compression_options() {
@@ -1387,66 +1330,7 @@ method = "put"
     assert!(matches!(put_parsed.http.method, HttpMethod::Put));
 }
 
-#[test]
-fn test_encoder_with_resource_attributes() {
-    use indexmap::IndexMap;
-
-    let mut otlp_config = OtlpConfig::default();
-    otlp_config.service_name = Some("test-service".to_string());
-    otlp_config.service_version = Some("1.0.0".to_string());
-    otlp_config.resource_attributes = IndexMap::from([
-        ("deployment.environment".to_string(), "test".to_string()),
-        ("k8s.cluster.name".to_string(), "test-cluster".to_string()),
-    ]);
-
-    let encoder = OtlpEncoder::new(otlp_config);
-
-    let mut log = LogEvent::from("test message with global resource attributes");
-    log.insert("host", "example.com");
-
-    let events = vec![Event::Log(log)];
-    let result = encoder.encode_logs(events).unwrap();
-
-    // Decode the protobuf to verify structure
-    let request = ExportLogsServiceRequest::decode(result.as_ref()).unwrap();
-    assert_eq!(request.resource_logs.len(), 1);
-
-    let resource_logs = &request.resource_logs[0];
-    let resource = resource_logs.resource.as_ref().unwrap();
-
-    // Verify global resource attributes are present
-    let attrs: std::collections::HashMap<String, String> = resource
-        .attributes
-        .iter()
-        .filter_map(|kv| {
-            if let Some(any_value) = &kv.value {
-                if let Some(value) = &any_value.value {
-                    match value {
-                        vector_lib::opentelemetry::proto::common::v1::any_value::Value::StringValue(s) => {
-                            Some((kv.key.clone(), s.clone()))
-                        }
-                        _ => None,
-                    }
-                } else {
-                    None
-                }
-            } else {
-                None
-            }
-        })
-        .collect();
-
-    assert_eq!(attrs.get("service.name"), Some(&"test-service".to_string()));
-    assert_eq!(attrs.get("service.version"), Some(&"1.0.0".to_string()));
-    assert_eq!(
-        attrs.get("deployment.environment"),
-        Some(&"test".to_string())
-    );
-    assert_eq!(
-        attrs.get("k8s.cluster.name"),
-        Some(&"test-cluster".to_string())
-    );
-}
+// Test removed - encoder no longer manipulates resource attributes
 
 #[test]
 fn test_complex_production_config() {
@@ -1461,19 +1345,7 @@ method = "post"
 compression = "gzip"
 encoding = "protobuf"
 
-[otlp]
-service_name = "user-service"
-service_version = "2.4.1"
-
-
-[otlp.resource_attributes]
-"service.name" = "user-service"
-"service.version" = "2.4.1"
-"deployment.environment" = "production"
-"k8s.cluster.name" = "prod-us-west-2"
-"k8s.namespace.name" = "services"
-"cloud.provider" = "aws"
-"cloud.region" = "us-west-2"
+# OTLP config is now empty
 "#;
 
     let config: OpenTelemetryConfig = toml::from_str(config_str).unwrap();
@@ -1490,26 +1362,7 @@ service_version = "2.4.1"
     assert!(matches!(config.http.compression, Compression::Gzip(_)));
     assert!(matches!(config.http.encoding, ContentEncoding::Protobuf));
 
-    // Verify OTLP config
-    assert_eq!(config.otlp.service_name, Some("user-service".to_string()));
-    assert_eq!(config.otlp.service_version, Some("2.4.1".to_string()));
-
-    // Verify resource attributes
-    assert_eq!(
-        config
-            .otlp
-            .resource_attributes
-            .get("deployment.environment"),
-        Some(&"production".to_string())
-    );
-    assert_eq!(
-        config.otlp.resource_attributes.get("k8s.cluster.name"),
-        Some(&"prod-us-west-2".to_string())
-    );
-    assert_eq!(
-        config.otlp.resource_attributes.get("cloud.provider"),
-        Some(&"aws".to_string())
-    );
+    // OTLP config is now empty struct
 }
 
 #[test]
@@ -1525,6 +1378,4 @@ endpoint = "http://localhost:4318"
     assert_eq!(config.logs_path, "/v1/logs");
     assert!(matches!(config.http.method, HttpMethod::Post));
     assert!(matches!(config.http.compression, Compression::None));
-    assert!(config.otlp.resource_attributes.is_empty());
-    assert!(config.otlp.service_name.is_none());
 }
