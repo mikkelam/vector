@@ -1093,4 +1093,42 @@ base: components: sinks: opentelemetry: configuration: {
 			}
 		}
 	}
+
+	healthcheck: {
+		description: """
+			Healthcheck configuration.
+
+			Configures how the sink performs healthchecks to verify connectivity
+			to the OTLP endpoint before starting to send data.
+			"""
+		required: false
+		type: object: options: {
+			path: {
+				description: """
+					Health endpoint path (relative to base endpoint).
+
+					The healthcheck will first try this path, and if it returns 404,
+					it will fall back to the root path. Common health paths include
+					"/health", "/healthz", and "/status".
+					"""
+				required: false
+				type: string: {
+					default: "/health"
+					examples: ["/health", "/healthz", "/status"]
+				}
+			}
+			skip: {
+				description: """
+					Skip healthcheck entirely.
+
+					This can be useful in environments where healthcheck requests
+					are not allowed or cause issues during startup.
+					"""
+				required: false
+				type: bool: {
+					default: false
+				}
+			}
+		}
+	}
 }

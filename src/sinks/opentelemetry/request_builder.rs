@@ -9,7 +9,7 @@ use crate::sinks::{
     util::{http::HttpRequest, Compression},
 };
 
-use super::{config::OtlpConfig, encoder::OtlpEncoder, sink::PartitionKey};
+use super::{encoder::OtlpEncoder, sink::PartitionKey};
 
 /// Builds `HttpRequest`s for the OTLP sink.
 #[derive(Debug, Clone)]
@@ -20,9 +20,9 @@ pub(super) struct OtlpRequestBuilder {
 
 impl OtlpRequestBuilder {
     /// Creates a new `OtlpRequestBuilder`.
-    pub(super) fn new(compression: Compression, otlp_config: OtlpConfig) -> Self {
+    pub(super) fn new(compression: Compression) -> Self {
         Self {
-            encoder: OtlpEncoder::new(otlp_config),
+            encoder: OtlpEncoder::new(),
             compression,
         }
     }

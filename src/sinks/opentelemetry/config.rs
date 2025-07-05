@@ -155,19 +155,6 @@ pub struct GrpcConfig {
     pub encoding: ContentEncoding,
 }
 
-/// OTLP-specific configuration options.
-#[configurable_component]
-#[derive(Clone, Debug)]
-pub struct OtlpConfig {}
-
-impl Default for OtlpConfig {
-    fn default() -> Self {
-        Self {}
-    }
-}
-
-impl OtlpConfig {}
-
 /// Configuration for the `opentelemetry` sink.
 ///
 /// This sink sends observability data to OpenTelemetry-compatible collectors
@@ -224,27 +211,11 @@ pub struct OpenTelemetryConfig {
     #[serde(default)]
     pub grpc: GrpcConfig,
 
-    /// OTLP-specific configuration options.
-    ///
-    /// These options control OTLP-specific behavior such as resource attributes,
-    /// service identification, and export settings.
-    #[configurable(derived)]
-    #[serde(default)]
-    pub otlp: OtlpConfig,
-
     #[configurable(derived)]
     #[serde(default)]
     auth: Option<Auth>,
 
     /// Custom HTTP headers to add to every HTTP request.
-    ///
-    /// # Examples
-    ///
-    /// ```toml
-    /// [sinks.my_opentelemetry_sink.request.headers]
-    /// X-API-Key = "secret-key"
-    /// X-Custom-Header = "custom-value"
-    /// ```
     #[configurable(derived)]
     #[serde(default)]
     request: RequestConfig,
@@ -296,7 +267,6 @@ impl Default for OpenTelemetryConfig {
             protocol: OtlpProtocol::default(),
             http: HttpConfig::default(),
             grpc: GrpcConfig::default(),
-            otlp: OtlpConfig::default(),
             auth: None,
             request: RequestConfig::default(),
             batch: BatchConfig::default(),
@@ -375,8 +345,7 @@ impl OpenTelemetryConfig {
             .settings(request_settings, http_response_retry_logic())
             .service(HttpService::new(client, service_builder));
 
-        let request_builder =
-            OtlpRequestBuilder::new(self.http.compression.clone(), self.otlp.clone());
+        let request_builder = OtlpRequestBuilder::new(self.http.compression.clone());
 
         let sink = OpenTelemetrySink::new(
             service,

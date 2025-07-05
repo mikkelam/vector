@@ -287,7 +287,7 @@ endpoint = "{}"
 
 #[test]
 fn test_encoder_resource_extraction() {
-    let encoder = OtlpEncoder::new(Default::default());
+    let encoder = OtlpEncoder::new();
 
     let mut log = LogEvent::from("test message");
     log.insert("host", "example.com");
@@ -320,7 +320,7 @@ fn test_encoder_resource_extraction() {
 
 #[test]
 fn test_encode_logs_method_directly() {
-    let encoder = OtlpEncoder::new(Default::default());
+    let encoder = OtlpEncoder::new();
 
     let mut log = LogEvent::from("direct test message");
     log.insert("test_key", "test_value");
@@ -515,7 +515,7 @@ fn test_extract_severity_field_priority() {
 
 #[test]
 fn test_severity_integration_with_encoder() {
-    let encoder = OtlpEncoder::new(Default::default());
+    let encoder = OtlpEncoder::new();
 
     let mut log = LogEvent::from("test message with severity");
     log.insert("level", "warn");
@@ -600,7 +600,7 @@ fn test_string_encoding_utf8_vs_bytes() {
 
 #[test]
 fn test_encoder_string_attributes() {
-    let encoder = OtlpEncoder::new(Default::default());
+    let encoder = OtlpEncoder::new();
 
     let mut log = LogEvent::from("test message");
     // Insert string that will be stored as Bytes internally
@@ -666,7 +666,7 @@ fn test_encode_metrics_counter() {
     use crate::event::{Metric, MetricKind, MetricValue};
     use vector_lib::opentelemetry::proto::collector::metrics::v1::ExportMetricsServiceRequest;
 
-    let encoder = OtlpEncoder::new(Default::default());
+    let encoder = OtlpEncoder::new();
 
     let metric = Metric::new(
         "test_counter",
@@ -744,7 +744,7 @@ fn test_encode_metrics_gauge() {
     use crate::event::{Metric, MetricKind, MetricValue};
     use vector_lib::opentelemetry::proto::collector::metrics::v1::ExportMetricsServiceRequest;
 
-    let encoder = OtlpEncoder::new(Default::default());
+    let encoder = OtlpEncoder::new();
 
     let metric = Metric::new(
         "test_gauge",
@@ -788,7 +788,7 @@ fn test_encode_metrics_histogram() {
     use crate::event::{Metric, MetricKind, MetricValue};
     use vector_lib::opentelemetry::proto::collector::metrics::v1::ExportMetricsServiceRequest;
 
-    let encoder = OtlpEncoder::new(Default::default());
+    let encoder = OtlpEncoder::new();
 
     let buckets = vec![
         Bucket {
@@ -864,7 +864,7 @@ fn test_metrics_partitioner() {
 
 #[test]
 fn test_encoder_routes_metrics_vs_logs() {
-    let encoder = OtlpEncoder::new(Default::default());
+    let encoder = OtlpEncoder::new();
     let mut writer = Vec::new();
 
     // Test that a metric event gets routed to metrics encoding
@@ -925,7 +925,7 @@ fn test_encoder_routes_metrics_vs_logs() {
 fn test_encode_traces_basic() {
     use vector_lib::opentelemetry::proto::collector::trace::v1::ExportTraceServiceRequest;
 
-    let encoder = OtlpEncoder::new(Default::default());
+    let encoder = OtlpEncoder::new();
     let trace_event = create_test_trace_event();
 
     let events = vec![trace_event];
@@ -958,7 +958,7 @@ fn test_encode_traces_with_attributes() {
     use std::collections::BTreeMap;
     use vrl::value::Value;
 
-    let encoder = OtlpEncoder::new(Default::default());
+    let encoder = OtlpEncoder::new();
 
     // Create trace with attributes
     let mut trace_fields = BTreeMap::new();
@@ -1020,7 +1020,7 @@ fn test_encode_traces_with_events() {
     use std::collections::BTreeMap;
     use vrl::value::Value;
 
-    let encoder = OtlpEncoder::new(Default::default());
+    let encoder = OtlpEncoder::new();
 
     // Create trace with span events
     let mut trace_fields = BTreeMap::new();
