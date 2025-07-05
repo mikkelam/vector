@@ -110,6 +110,7 @@ impl Default for HealthcheckConfig {
 /// HTTP transport configuration for OTLP.
 #[configurable_component]
 #[derive(Clone, Debug, Default)]
+#[serde(rename_all = "snake_case")]
 pub struct HttpConfig {
     /// The HTTP method to use when sending requests.
     ///
@@ -119,8 +120,6 @@ pub struct HttpConfig {
     pub method: HttpMethod,
 
     /// Compression algorithm to use for request bodies.
-    ///
-    /// Compression can significantly reduce bandwidth usage, especially for large payloads.
     /// Most OTLP collectors support gzip compression.
     #[configurable(derived)]
     #[serde(default)]
@@ -139,6 +138,7 @@ pub struct HttpConfig {
 /// Currently not implemented but reserved for future gRPC support.
 #[configurable_component]
 #[derive(Clone, Debug, Default)]
+#[serde(rename_all = "snake_case")]
 pub struct GrpcConfig {
     /// Compression algorithm to use for gRPC requests.
     ///
@@ -247,6 +247,7 @@ pub struct OpenTelemetryConfig {
 /// will be extended to include gRPC once the implementation is complete.
 #[configurable_component]
 #[derive(Clone, Debug, Default)]
+#[serde(rename_all = "snake_case")]
 pub enum OtlpProtocol {
     /// Send data over HTTP with Protobuf encoding.
     ///
