@@ -345,7 +345,7 @@ impl OpenTelemetryConfig {
             .settings(request_settings, http_response_retry_logic())
             .service(HttpService::new(client, service_builder));
 
-        let request_builder = OtlpRequestBuilder::new(self.http.compression.clone());
+        let request_builder = OtlpRequestBuilder::new(self.http.compression.clone(), self.clone());
 
         let sink = OpenTelemetrySink::new(
             service,

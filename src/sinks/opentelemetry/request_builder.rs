@@ -20,9 +20,12 @@ pub(super) struct OtlpRequestBuilder {
 
 impl OtlpRequestBuilder {
     /// Creates a new `OtlpRequestBuilder`.
-    pub(super) fn new(compression: Compression) -> Self {
+    pub(super) fn new(
+        compression: Compression,
+        config: super::config::OpenTelemetryConfig,
+    ) -> Self {
         Self {
-            encoder: OtlpEncoder::new(),
+            encoder: OtlpEncoder::new(config),
             compression,
         }
     }

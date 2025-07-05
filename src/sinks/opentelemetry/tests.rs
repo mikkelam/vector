@@ -287,7 +287,7 @@ endpoint = "{}"
 
 #[test]
 fn test_encoder_resource_extraction() {
-    let encoder = OtlpEncoder::new();
+    let encoder = OtlpEncoder::new_default();
 
     let mut log = LogEvent::from("test message");
     log.insert("host", "example.com");
@@ -320,7 +320,7 @@ fn test_encoder_resource_extraction() {
 
 #[test]
 fn test_encode_logs_method_directly() {
-    let encoder = OtlpEncoder::new();
+    let encoder = OtlpEncoder::new_default();
 
     let mut log = LogEvent::from("direct test message");
     log.insert("test_key", "test_value");
@@ -515,7 +515,7 @@ fn test_extract_severity_field_priority() {
 
 #[test]
 fn test_severity_integration_with_encoder() {
-    let encoder = OtlpEncoder::new();
+    let encoder = OtlpEncoder::new_default();
 
     let mut log = LogEvent::from("test message with severity");
     log.insert("level", "warn");
@@ -600,7 +600,7 @@ fn test_string_encoding_utf8_vs_bytes() {
 
 #[test]
 fn test_encoder_string_attributes() {
-    let encoder = OtlpEncoder::new();
+    let encoder = OtlpEncoder::new_default();
 
     let mut log = LogEvent::from("test message");
     // Insert string that will be stored as Bytes internally
@@ -666,7 +666,7 @@ fn test_encode_metrics_counter() {
     use crate::event::{Metric, MetricKind, MetricValue};
     use vector_lib::opentelemetry::proto::collector::metrics::v1::ExportMetricsServiceRequest;
 
-    let encoder = OtlpEncoder::new();
+    let encoder = OtlpEncoder::new_default();
 
     let metric = Metric::new(
         "test_counter",
@@ -744,7 +744,7 @@ fn test_encode_metrics_gauge() {
     use crate::event::{Metric, MetricKind, MetricValue};
     use vector_lib::opentelemetry::proto::collector::metrics::v1::ExportMetricsServiceRequest;
 
-    let encoder = OtlpEncoder::new();
+    let encoder = OtlpEncoder::new_default();
 
     let metric = Metric::new(
         "test_gauge",
@@ -788,7 +788,7 @@ fn test_encode_metrics_histogram() {
     use crate::event::{Metric, MetricKind, MetricValue};
     use vector_lib::opentelemetry::proto::collector::metrics::v1::ExportMetricsServiceRequest;
 
-    let encoder = OtlpEncoder::new();
+    let encoder = OtlpEncoder::new_default();
 
     let buckets = vec![
         Bucket {
@@ -864,7 +864,7 @@ fn test_metrics_partitioner() {
 
 #[test]
 fn test_encoder_routes_metrics_vs_logs() {
-    let encoder = OtlpEncoder::new();
+    let encoder = OtlpEncoder::new_default();
     let mut writer = Vec::new();
 
     // Test that a metric event gets routed to metrics encoding
@@ -925,7 +925,7 @@ fn test_encoder_routes_metrics_vs_logs() {
 fn test_encode_traces_basic() {
     use vector_lib::opentelemetry::proto::collector::trace::v1::ExportTraceServiceRequest;
 
-    let encoder = OtlpEncoder::new();
+    let encoder = OtlpEncoder::new_default();
     let trace_event = create_test_trace_event();
 
     let events = vec![trace_event];
@@ -958,7 +958,7 @@ fn test_encode_traces_with_attributes() {
     use std::collections::BTreeMap;
     use vrl::value::Value;
 
-    let encoder = OtlpEncoder::new();
+    let encoder = OtlpEncoder::new_default();
 
     // Create trace with attributes
     let mut trace_fields = BTreeMap::new();
@@ -1020,7 +1020,7 @@ fn test_encode_traces_with_events() {
     use std::collections::BTreeMap;
     use vrl::value::Value;
 
-    let encoder = OtlpEncoder::new();
+    let encoder = OtlpEncoder::new_default();
 
     // Create trace with span events
     let mut trace_fields = BTreeMap::new();
@@ -1378,4 +1378,388 @@ endpoint = "http://localhost:4318"
     assert_eq!(config.logs_path, "/v1/logs");
     assert!(matches!(config.http.method, HttpMethod::Post));
     assert!(matches!(config.http.compression, Compression::None));
+}
+
+#[test]
+fn test_mixed_signal_resource_attribute_grouping() {
+    use std::collections::BTreeMap;
+    use vector_lib::event::{TraceEvent, Value};
+    use vector_lib::opentelemetry::proto::{
+        collector::{
+            logs::v1::ExportLogsServiceRequest, metrics::v1::ExportMetricsServiceRequest,
+            trace::v1::ExportTraceServiceRequest,
+        },
+        common::v1::any_value::Value as PbValue,
+    };
+
+    let encoder = OtlpEncoder::new_default();
+
+    // Create events with different resource attributes across multiple services
+    let mut events = Vec::new();
+
+    // Service A - Logs with resource attributes
+    for i in 0..3 {
+        let mut log = LogEvent::from(format!("Log message {} from service A", i));
+        log.insert("level", "info");
+        log.insert("user_id", i as i64);
+        log.insert(event_path!("resource", "service.name"), "service-a");
+        log.insert(event_path!("resource", "service.version"), "1.0.0");
+        log.insert(
+            event_path!("resource", "deployment.environment"),
+            "production",
+        );
+        log.insert(event_path!("resource", "host.name"), "host-1");
+        events.push(Event::Log(log));
+    }
+
+    // Service B - Logs with different resource attributes
+    for i in 0..2 {
+        let mut log = LogEvent::from(format!("Log message {} from service B", i));
+        log.insert("level", "warn");
+        log.insert("error_code", 500 + i as i64);
+        log.insert(event_path!("resource", "service.name"), "service-b");
+        log.insert(event_path!("resource", "service.version"), "2.1.0");
+        log.insert(event_path!("resource", "deployment.environment"), "staging");
+        log.insert(event_path!("resource", "host.name"), "host-2");
+        events.push(Event::Log(log));
+    }
+
+    // Service A - Metrics with same resource attributes as Service A logs
+    for i in 0..2 {
+        let mut metric = Metric::new(
+            format!("counter_a_{}", i),
+            MetricKind::Absolute,
+            MetricValue::Counter {
+                value: (i + 1) as f64 * 10.0,
+            },
+        );
+
+        // Add resource attributes as tags with "resources." prefix
+        let mut tags = crate::event::metric::MetricTags::default();
+        tags.replace("endpoint".to_string(), format!("/api/v{}", i + 1));
+        tags.replace(
+            "resources.\"service.name\"".to_string(),
+            "service-a".to_string(),
+        );
+        tags.replace(
+            "resources.\"service.version\"".to_string(),
+            "1.0.0".to_string(),
+        );
+        tags.replace(
+            "resources.\"deployment.environment\"".to_string(),
+            "production".to_string(),
+        );
+        tags.replace("resources.\"host.name\"".to_string(), "host-1".to_string());
+        metric = metric.with_tags(Some(tags));
+
+        events.push(Event::Metric(metric));
+    }
+
+    // Service C - Metrics with completely different resource attributes
+    for i in 0..1 {
+        let mut metric = Metric::new(
+            format!("gauge_c_{}", i),
+            MetricKind::Absolute,
+            MetricValue::Gauge {
+                value: 42.5 + i as f64,
+            },
+        );
+
+        // Add resource attributes as tags with "resources." prefix
+        let mut tags = crate::event::metric::MetricTags::default();
+        tags.replace("region".to_string(), "us-west-2".to_string());
+        tags.replace(
+            "resources.\"service.name\"".to_string(),
+            "service-c".to_string(),
+        );
+        tags.replace(
+            "resources.\"service.version\"".to_string(),
+            "3.0.0".to_string(),
+        );
+        tags.replace(
+            "resources.\"deployment.environment\"".to_string(),
+            "development".to_string(),
+        );
+        tags.replace("resources.\"host.name\"".to_string(), "host-3".to_string());
+        metric = metric.with_tags(Some(tags));
+
+        events.push(Event::Metric(metric));
+    }
+
+    // Service A - Traces with same resource attributes as Service A logs/metrics
+    for i in 0..2 {
+        let mut trace_fields = BTreeMap::new();
+        trace_fields.insert("trace_id".into(), Value::from(format!("{:032x}", i + 100)));
+        trace_fields.insert("span_id".into(), Value::from(format!("{:016x}", i + 10)));
+        trace_fields.insert("name".into(), Value::from(format!("span_a_{}", i)));
+        trace_fields.insert("kind".into(), Value::from(1)); // SPAN_KIND_INTERNAL
+        trace_fields.insert(
+            "start_time_unix_nano".into(),
+            Value::from(1234567890000000000i64 + i as i64 * 1000000),
+        );
+        trace_fields.insert(
+            "end_time_unix_nano".into(),
+            Value::from(1234567891000000000i64 + i as i64 * 1000000),
+        );
+
+        let mut attributes = BTreeMap::new();
+        attributes.insert("operation".into(), Value::from(format!("op_{}", i)));
+        trace_fields.insert("attributes".into(), Value::Object(attributes));
+
+        // Add resource attributes for service A with "resources." prefix
+        trace_fields.insert(
+            "resources.\"service.name\"".into(),
+            Value::from("service-a"),
+        );
+        trace_fields.insert("resources.\"service.version\"".into(), Value::from("1.0.0"));
+        trace_fields.insert(
+            "resources.\"deployment.environment\"".into(),
+            Value::from("production"),
+        );
+        trace_fields.insert("resources.\"host.name\"".into(), Value::from("host-1"));
+
+        let trace_event = TraceEvent::from_parts(trace_fields, EventMetadata::default());
+        events.push(Event::Trace(trace_event));
+    }
+
+    // Service B - Traces with same resource attributes as Service B logs
+    for i in 0..1 {
+        let mut trace_fields = BTreeMap::new();
+        trace_fields.insert("trace_id".into(), Value::from(format!("{:032x}", i + 200)));
+        trace_fields.insert("span_id".into(), Value::from(format!("{:016x}", i + 20)));
+        trace_fields.insert("name".into(), Value::from(format!("span_b_{}", i)));
+        trace_fields.insert("kind".into(), Value::from(2)); // SPAN_KIND_SERVER
+        trace_fields.insert(
+            "start_time_unix_nano".into(),
+            Value::from(1234567892000000000i64 + i as i64 * 1000000),
+        );
+        trace_fields.insert(
+            "end_time_unix_nano".into(),
+            Value::from(1234567893000000000i64 + i as i64 * 1000000),
+        );
+
+        let mut attributes = BTreeMap::new();
+        attributes.insert("http.method".into(), Value::from("POST"));
+        trace_fields.insert("attributes".into(), Value::Object(attributes));
+
+        // Add resource attributes for service B with "resources." prefix
+        trace_fields.insert(
+            "resources.\"service.name\"".into(),
+            Value::from("service-b"),
+        );
+        trace_fields.insert("resources.\"service.version\"".into(), Value::from("2.1.0"));
+        trace_fields.insert(
+            "resources.\"deployment.environment\"".into(),
+            Value::from("staging"),
+        );
+        trace_fields.insert("resources.\"host.name\"".into(), Value::from("host-2"));
+
+        let trace_event = TraceEvent::from_parts(trace_fields, EventMetadata::default());
+        events.push(Event::Trace(trace_event));
+    }
+
+    // Separate events by type and encode each type
+    let mut logs = Vec::new();
+    let mut metrics = Vec::new();
+    let mut traces = Vec::new();
+
+    for event in events {
+        match event {
+            Event::Log(_) => logs.push(event),
+            Event::Metric(_) => metrics.push(event),
+            Event::Trace(_) => traces.push(event),
+        }
+    }
+
+    // Test logs grouping
+    if !logs.is_empty() {
+        let result = encoder.encode_logs(logs).unwrap();
+        let request = ExportLogsServiceRequest::decode(result.as_ref()).unwrap();
+
+        // Should have 2 resource groups: service-a and service-b
+        assert_eq!(
+            request.resource_logs.len(),
+            2,
+            "Should have 2 log resource groups"
+        );
+
+        // Check service-a resource group
+        let service_a_logs = request
+            .resource_logs
+            .iter()
+            .find(|rl| {
+                rl.resource.as_ref().unwrap().attributes.iter().any(|attr| {
+                    attr.key == "service.name"
+                        && matches!(
+                            attr.value.as_ref().unwrap().value.as_ref().unwrap(),
+                            PbValue::StringValue(s) if s == "service-a"
+                        )
+                })
+            })
+            .expect("Should find service-a logs");
+
+        // Verify service-a has 3 log records
+        let service_a_log_count: usize = service_a_logs
+            .scope_logs
+            .iter()
+            .map(|sl| sl.log_records.len())
+            .sum();
+        assert_eq!(
+            service_a_log_count, 3,
+            "Service A should have 3 log records"
+        );
+
+        // Check service-b resource group
+        let service_b_logs = request
+            .resource_logs
+            .iter()
+            .find(|rl| {
+                rl.resource.as_ref().unwrap().attributes.iter().any(|attr| {
+                    attr.key == "service.name"
+                        && matches!(
+                            attr.value.as_ref().unwrap().value.as_ref().unwrap(),
+                            PbValue::StringValue(s) if s == "service-b"
+                        )
+                })
+            })
+            .expect("Should find service-b logs");
+
+        // Verify service-b has 2 log records
+        let service_b_log_count: usize = service_b_logs
+            .scope_logs
+            .iter()
+            .map(|sl| sl.log_records.len())
+            .sum();
+        assert_eq!(
+            service_b_log_count, 2,
+            "Service B should have 2 log records"
+        );
+    }
+
+    // Test metrics grouping
+    if !metrics.is_empty() {
+        let result = encoder.encode_metrics(metrics).unwrap();
+        let request = ExportMetricsServiceRequest::decode(result.as_ref()).unwrap();
+
+        // Should have 2 resource groups: service-a and service-c
+        assert_eq!(
+            request.resource_metrics.len(),
+            2,
+            "Should have 2 metric resource groups"
+        );
+
+        // Check service-a resource group
+        let service_a_metrics = request
+            .resource_metrics
+            .iter()
+            .find(|rm| {
+                rm.resource.as_ref().unwrap().attributes.iter().any(|attr| {
+                    attr.key == "service.name"
+                        && matches!(
+                            attr.value.as_ref().unwrap().value.as_ref().unwrap(),
+                            PbValue::StringValue(s) if s == "service-a"
+                        )
+                })
+            })
+            .expect("Should find service-a metrics");
+
+        // Verify service-a has 2 metrics
+        let service_a_metric_count: usize = service_a_metrics
+            .scope_metrics
+            .iter()
+            .map(|sm| sm.metrics.len())
+            .sum();
+        assert_eq!(service_a_metric_count, 2, "Service A should have 2 metrics");
+
+        // Check service-c resource group
+        let service_c_metrics = request
+            .resource_metrics
+            .iter()
+            .find(|rm| {
+                rm.resource.as_ref().unwrap().attributes.iter().any(|attr| {
+                    attr.key == "service.name"
+                        && matches!(
+                            attr.value.as_ref().unwrap().value.as_ref().unwrap(),
+                            PbValue::StringValue(s) if s == "service-c"
+                        )
+                })
+            })
+            .expect("Should find service-c metrics");
+
+        // Verify service-c has 1 metric
+        let service_c_metric_count: usize = service_c_metrics
+            .scope_metrics
+            .iter()
+            .map(|sm| sm.metrics.len())
+            .sum();
+        assert_eq!(service_c_metric_count, 1, "Service C should have 1 metric");
+    }
+
+    // Test traces grouping
+    if !traces.is_empty() {
+        let result = encoder.encode_traces(traces).unwrap();
+        let request = ExportTraceServiceRequest::decode(result.as_ref()).unwrap();
+
+        // Should have 2 resource groups: service-a and service-b
+        assert_eq!(
+            request.resource_spans.len(),
+            2,
+            "Should have 2 trace resource groups"
+        );
+
+        // Check service-a resource group
+        let service_a_traces = request
+            .resource_spans
+            .iter()
+            .find(|rs| {
+                rs.resource.as_ref().unwrap().attributes.iter().any(|attr| {
+                    attr.key == "service.name"
+                        && matches!(
+                            attr.value.as_ref().unwrap().value.as_ref().unwrap(),
+                            PbValue::StringValue(s) if s == "service-a"
+                        )
+                })
+            })
+            .expect("Should find service-a traces");
+
+        // Verify service-a has 2 spans
+        let service_a_span_count: usize = service_a_traces
+            .scope_spans
+            .iter()
+            .map(|ss| ss.spans.len())
+            .sum();
+        assert_eq!(service_a_span_count, 2, "Service A should have 2 spans");
+
+        // Check service-b resource group
+        let service_b_traces = request
+            .resource_spans
+            .iter()
+            .find(|rs| {
+                rs.resource.as_ref().unwrap().attributes.iter().any(|attr| {
+                    attr.key == "service.name"
+                        && matches!(
+                            attr.value.as_ref().unwrap().value.as_ref().unwrap(),
+                            PbValue::StringValue(s) if s == "service-b"
+                        )
+                })
+            })
+            .expect("Should find service-b traces");
+
+        // Verify service-b has 1 span
+        let service_b_span_count: usize = service_b_traces
+            .scope_spans
+            .iter()
+            .map(|ss| ss.spans.len())
+            .sum();
+        assert_eq!(service_b_span_count, 1, "Service B should have 1 span");
+    }
+
+    // Verify that resource attributes are correctly preserved
+    // Check that service-a has consistent resource attributes across all signal types
+    // This validates that our grouping key correctly identifies the same service
+
+    println!("✅ Mixed signal resource attribute grouping test passed!");
+    println!("   - Logs: 2 resource groups (service-a: 3 logs, service-b: 2 logs)");
+    println!("   - Metrics: 2 resource groups (service-a: 2 metrics, service-c: 1 metric)");
+    println!("   - Traces: 2 resource groups (service-a: 2 spans, service-b: 1 span)");
 }

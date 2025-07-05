@@ -43,7 +43,7 @@ use crate::{
     },
 };
 
-use super::config::OtlpConfig;
+use super::config::OpenTelemetryConfig;
 
 /// Trait for extracting and removing resource attributes from events
 trait ResourceAttributeExtractor {
@@ -246,42 +246,89 @@ impl MetricNormalize for OtlpMetricNormalize {
 
 impl OtlpEncoder {
     /// Creates a new `OtlpEncoder`.
-    pub(super) const fn new(_otlp_config: OtlpConfig) -> Self {
+    pub(super) fn new(_otlp_config: OpenTelemetryConfig) -> Self {
         Self {}
+    }
+
+    /// Creates a new `OtlpEncoder` with default configuration for testing.
+    #[cfg(test)]
+    pub(super) fn new_default() -> Self {
+        Self {}
+    }
+
+    /// Groups events by their resource attributes - reusable across logs/metrics/traces
+    fn group_events_by_resource_attributes<T>(
+        &self,
+        events: Vec<T>,
+    ) -> std::collections::HashMap<String, (Vec<KeyValue>, Vec<T>)>
+    where
+        T: ResourceAttributeExtractor,
+    {
+        let mut groups: std::collections::HashMap<String, (Vec<KeyValue>, Vec<T>)> =
+            std::collections::HashMap::new();
+
+        for mut event in events {
+            let attrs = event.extract_all_resource_attributes();
+            // Create a stable string key from the attributes
+            let key = attrs
+                .iter()
+                .map(|kv| {
+                    let value_str = kv.value.as_ref().map_or(String::new(), |v| match &v.value {
+                        Some(value) => match value {
+                            PbValue::StringValue(s) => s.clone(),
+                            PbValue::IntValue(i) => i.to_string(),
+                            PbValue::DoubleValue(d) => d.to_string(),
+                            PbValue::BoolValue(b) => b.to_string(),
+                            _ => String::new(),
+                        },
+                        None => String::new(),
+                    });
+                    format!("{}={}", kv.key, value_str)
+                })
+                .collect::<Vec<_>>()
+                .join(",");
+
+            let attrs_clone = attrs.clone();
+            groups
+                .entry(key)
+                .or_insert_with(|| (attrs_clone, Vec::new()))
+                .1
+                .push(event);
+        }
+
+        groups
     }
 
     /// Encodes a batch of log events into an `ExportLogsServiceRequest` Protobuf message.
     pub fn encode_logs(&self, events: Vec<Event>) -> Result<Bytes, ()> {
-        let mut log_records = Vec::new();
-        let mut resource_attributes = Vec::new();
+        let log_events: Vec<LogEvent> = events.into_iter().map(|e| e.into_log()).collect();
+        let resource_groups = self.group_events_by_resource_attributes(log_events);
 
-        for (index, event) in events.into_iter().enumerate() {
-            let mut log = event.into_log();
+        let resource_logs = resource_groups
+            .into_iter()
+            .map(|(_key, (resource_attrs, mut events))| {
+                // Remove resource attributes from events since they're now at the resource level
+                events
+                    .iter_mut()
+                    .for_each(|event| event.remove_all_resource_attributes());
 
-            // Extract resource from first event only to avoid duplication
-            if index == 0 {
-                resource_attributes = log.extract_all_resource_attributes();
-            } else {
-                log.remove_all_resource_attributes();
-            }
+                let log_records = events
+                    .into_iter()
+                    .map(|event| self.convert_log_event_to_log_record(event))
+                    .collect();
 
-            let log_record = self.convert_log_event_to_log_record(log);
-            log_records.push(log_record);
-        }
-
-        let scope_logs = vec![self.create_scope_logs(log_records)];
-
-        let resource_logs = vec![ResourceLogs {
-            resource: Some(Resource {
-                attributes: resource_attributes,
-                dropped_attributes_count: 0,
-            }),
-            scope_logs,
-            schema_url: String::new(),
-        }];
+                ResourceLogs {
+                    resource: Some(Resource {
+                        attributes: resource_attrs,
+                        dropped_attributes_count: 0,
+                    }),
+                    scope_logs: vec![self.create_scope_logs(log_records)],
+                    schema_url: String::new(),
+                }
+            })
+            .collect();
 
         let request = ExportLogsServiceRequest { resource_logs };
-
         Ok(request.encode_to_vec().into())
     }
 
@@ -377,77 +424,74 @@ impl OtlpEncoder {
 
     /// Encodes a batch of metric events into an `ExportMetricsServiceRequest` Protobuf message.
     pub(super) fn encode_metrics(&self, events: Vec<Event>) -> Result<Bytes, ()> {
-        let mut metric_records = Vec::new();
-        let mut resource_attributes = Vec::new();
+        let metrics: Vec<VectorMetric> = events.into_iter().map(|e| e.into_metric()).collect();
+        let resource_groups = self.group_events_by_resource_attributes(metrics);
 
-        // Normalize metrics to absolute (cumulative) values for consistent OTLP semantics
-        let mut normalizer = OtlpMetricNormalize::default();
-        let mut metric_state = MetricSet::default();
+        let resource_metrics = resource_groups
+            .into_iter()
+            .map(|(_key, (resource_attrs, mut metrics))| {
+                // Remove resource attributes from metrics since they're now at the resource level
+                metrics
+                    .iter_mut()
+                    .for_each(|metric| metric.remove_all_resource_attributes());
 
-        for (index, event) in events.into_iter().enumerate() {
-            let mut metric = event.into_metric();
+                // Apply normalization to convert incremental metrics to absolute
+                let mut normalizer = OtlpMetricNormalize::default();
+                let mut metric_state = MetricSet::default();
 
-            // Extract resource from first event only to avoid duplication
-            if index == 0 {
-                resource_attributes = metric.extract_all_resource_attributes();
-            } else {
-                metric.remove_all_resource_attributes();
-            }
+                let metric_records: Vec<_> = metrics
+                    .into_iter()
+                    .filter_map(|metric| {
+                        normalizer
+                            .normalize(&mut metric_state, metric)
+                            .map(convert_vector_metric_to_otlp)
+                    })
+                    .collect();
 
-            // Apply normalization to convert incremental metrics to absolute
-            if let Some(normalized_metric) = normalizer.normalize(&mut metric_state, metric) {
-                let otlp_metric = convert_vector_metric_to_otlp(normalized_metric);
-                metric_records.push(otlp_metric);
-            }
-        }
-
-        let scope_metrics = vec![self.create_scope_metrics(metric_records)];
-
-        let resource_metrics = vec![ResourceMetrics {
-            resource: Some(Resource {
-                attributes: resource_attributes,
-                dropped_attributes_count: 0,
-            }),
-            scope_metrics,
-            schema_url: String::new(),
-        }];
+                ResourceMetrics {
+                    resource: Some(Resource {
+                        attributes: resource_attrs,
+                        dropped_attributes_count: 0,
+                    }),
+                    scope_metrics: vec![self.create_scope_metrics(metric_records)],
+                    schema_url: String::new(),
+                }
+            })
+            .collect();
 
         let request = ExportMetricsServiceRequest { resource_metrics };
-
         Ok(request.encode_to_vec().into())
     }
 
     pub fn encode_traces(&self, events: Vec<Event>) -> Result<Bytes, ()> {
-        let mut spans = Vec::new();
-        let mut resource_attributes = Vec::new();
+        let traces: Vec<TraceEvent> = events.into_iter().map(|e| e.into_trace()).collect();
+        let resource_groups = self.group_events_by_resource_attributes(traces);
 
-        for (index, event) in events.into_iter().enumerate() {
-            let mut trace = event.into_trace();
+        let resource_spans = resource_groups
+            .into_iter()
+            .map(|(_key, (resource_attrs, mut traces))| {
+                // Remove resource attributes from traces since they're now at the resource level
+                traces
+                    .iter_mut()
+                    .for_each(|trace| trace.remove_all_resource_attributes());
 
-            // Extract resource from first event only to avoid duplication
-            if index == 0 {
-                resource_attributes = trace.extract_all_resource_attributes();
-            } else {
-                trace.remove_all_resource_attributes();
-            }
+                let spans: Vec<_> = traces
+                    .into_iter()
+                    .map(convert_vector_trace_to_otlp_span)
+                    .collect();
 
-            let span = convert_vector_trace_to_otlp_span(trace);
-            spans.push(span);
-        }
-
-        let scope_spans = vec![self.create_scope_spans(spans)];
-
-        let resource_spans = vec![ResourceSpans {
-            resource: Some(Resource {
-                attributes: resource_attributes,
-                dropped_attributes_count: 0,
-            }),
-            scope_spans,
-            schema_url: String::new(),
-        }];
+                ResourceSpans {
+                    resource: Some(Resource {
+                        attributes: resource_attrs,
+                        dropped_attributes_count: 0,
+                    }),
+                    scope_spans: vec![self.create_scope_spans(spans)],
+                    schema_url: String::new(),
+                }
+            })
+            .collect();
 
         let request = ExportTraceServiceRequest { resource_spans };
-
         Ok(request.encode_to_vec().into())
     }
 
@@ -1323,7 +1367,7 @@ mod tests {
 
     #[test]
     fn test_trace_id_hex_decoding() {
-        let encoder = OtlpEncoder::new(OtlpConfig::default());
+        let encoder = OtlpEncoder::new_default();
 
         // Create log event with hex string trace_id (as stored by Vector's OTLP source)
         let mut log = LogEvent::from("test message");
@@ -1346,7 +1390,7 @@ mod tests {
 
     #[test]
     fn test_invalid_trace_id_hex() {
-        let encoder = OtlpEncoder::new(OtlpConfig::default());
+        let encoder = OtlpEncoder::new_default();
 
         let mut log = LogEvent::from("test message");
         log.insert("trace_id", "invalid_hex"); // Invalid hex
@@ -1361,7 +1405,7 @@ mod tests {
 
     #[test]
     fn test_missing_trace_context() {
-        let encoder = OtlpEncoder::new(OtlpConfig::default());
+        let encoder = OtlpEncoder::new_default();
 
         let log = LogEvent::from("test message");
         let log_record = encoder.convert_log_event_to_log_record(log);
@@ -1373,7 +1417,7 @@ mod tests {
 
     #[test]
     fn test_hex_strings_from_source() {
-        let encoder = OtlpEncoder::new(OtlpConfig::default());
+        let encoder = OtlpEncoder::new_default();
 
         let mut log = LogEvent::from("test message");
         // Insert hex strings as they come from Vector's OTLP source (legacy namespace)
@@ -1396,7 +1440,7 @@ mod tests {
 
     #[test]
     fn test_flattened_otlp_structure() {
-        let encoder = OtlpEncoder::new(OtlpConfig::default());
+        let encoder = OtlpEncoder::new_default();
 
         // Create log event with flattened OTLP structure as Vector's source provides
         let mut log = LogEvent::from("Processing DELETE /api/orders/789");
@@ -1499,7 +1543,7 @@ mod tests {
 
     #[test]
     fn test_quoted_vs_unquoted_attribute_keys() {
-        let encoder = OtlpEncoder::new(OtlpConfig::default());
+        let encoder = OtlpEncoder::new_default();
 
         // Test with quoted keys (as seen from Vector's OTLP source)
         let mut log1 = LogEvent::from("test message 1");
@@ -1590,7 +1634,7 @@ mod tests {
             collector::metrics::v1::ExportMetricsServiceRequest, metrics::v1::metric::Data,
         };
 
-        let encoder = OtlpEncoder::new(OtlpConfig::default());
+        let encoder = OtlpEncoder::new_default();
 
         // Test Set metric (converted to gauge with cardinality)
         let mut set_values = BTreeSet::new();
@@ -1710,7 +1754,7 @@ mod tests {
             metrics::v1::{metric::Data, AggregationTemporality},
         };
 
-        let encoder = OtlpEncoder::new(OtlpConfig::default());
+        let encoder = OtlpEncoder::new_default();
 
         // Test that absolute metrics pass through unchanged
         let absolute_counter = Event::Metric(
@@ -1802,7 +1846,7 @@ mod tests {
         ]));
         let event = Event::Trace(trace_event);
 
-        let encoder = OtlpEncoder::new(OtlpConfig::default());
+        let encoder = OtlpEncoder::new_default();
         let mut buf = Vec::new();
         let result = encoder.encode_input(vec![event], &mut buf);
         assert!(result.is_ok());
@@ -1858,7 +1902,7 @@ mod tests {
             metrics::v1::{metric::Data, AggregationTemporality},
         };
 
-        let encoder = OtlpEncoder::new(OtlpConfig::default());
+        let encoder = OtlpEncoder::new_default();
 
         // Test Counter metric (using Absolute to avoid normalization dropping)
         let counter = Event::Metric(
@@ -1962,7 +2006,7 @@ mod tests {
 
         use vector_lib::opentelemetry::proto::collector::metrics::v1::ExportMetricsServiceRequest;
 
-        let encoder = OtlpEncoder::new(OtlpConfig::default());
+        let encoder = OtlpEncoder::new_default();
 
         // Create metric with flattened resource attributes
         let mut metric = VectorMetric::new(
@@ -2037,7 +2081,7 @@ mod tests {
 
         use vector_lib::opentelemetry::proto::collector::trace::v1::ExportTraceServiceRequest;
 
-        let encoder = OtlpEncoder::new(OtlpConfig::default());
+        let encoder = OtlpEncoder::new_default();
 
         // Create trace with flattened resource attributes
         let mut trace_fields = ObjectMap::new();
