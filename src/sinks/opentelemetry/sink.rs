@@ -26,7 +26,7 @@ pub(super) struct KeyPartitioner {
 
 impl KeyPartitioner {
     /// Creates a new `KeyPartitioner`.
-    pub fn new(log_endpoint: String, trace_endpoint: String, metric_endpoint: String) -> Self {
+    pub const fn new(log_endpoint: String, trace_endpoint: String, metric_endpoint: String) -> Self {
         Self {
             log_endpoint,
             trace_endpoint,
@@ -70,7 +70,7 @@ where
     S::Error: std::fmt::Debug + Into<crate::Error> + Send,
 {
     /// Creates a new `OpenTelemetrySink`.
-    pub(super) fn new(
+    pub(super) const fn new(
         service: S,
         batch_settings: BatcherSettings,
         request_builder: OtlpRequestBuilder,

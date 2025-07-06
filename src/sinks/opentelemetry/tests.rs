@@ -64,11 +64,11 @@ async fn test_http_log_request() {
 
     // Use Arc<Mutex<Vec<...>>> to capture requests
     let received_requests = Arc::new(Mutex::new(Vec::new()));
-    let received_requests_clone = received_requests.clone();
+    let received_requests_clone = Arc::clone(&received_requests);
 
     // Create a mock HTTP server that captures requests
     let handler = move |req: Request<Body>| {
-        let received_requests = received_requests_clone.clone();
+        let received_requests = Arc::clone(&received_requests_clone);
         async move {
             let (parts, body) = req.into_parts();
             let body_bytes = hyper::body::to_bytes(body).await.unwrap();
@@ -205,11 +205,11 @@ async fn test_http_trace_request() {
 
     // Use Arc<Mutex<Vec<...>>> to capture requests
     let received_requests = Arc::new(Mutex::new(Vec::new()));
-    let received_requests_clone = received_requests.clone();
+    let received_requests_clone = Arc::clone(&received_requests);
 
     // Create a mock HTTP server that captures requests
     let handler = move |req: Request<Body>| {
-        let received_requests = received_requests_clone.clone();
+        let received_requests = Arc::clone(&received_requests_clone);
         async move {
             let (parts, body) = req.into_parts();
             let body_bytes = hyper::body::to_bytes(body).await.unwrap();
@@ -1116,11 +1116,11 @@ async fn test_custom_paths_configuration() {
 
     // Use Arc<Mutex<Vec<...>>> to capture requests
     let received_requests = Arc::new(Mutex::new(Vec::new()));
-    let received_requests_clone = received_requests.clone();
+    let received_requests_clone = Arc::clone(&received_requests);
 
     // Create a mock HTTP server that captures requests
     let handler = move |req: Request<Body>| {
-        let received_requests = received_requests_clone.clone();
+        let received_requests = Arc::clone(&received_requests_clone);
         async move {
             let (parts, body) = req.into_parts();
             let body_bytes = hyper::body::to_bytes(body).await.unwrap();
@@ -1758,8 +1758,8 @@ fn test_mixed_signal_resource_attribute_grouping() {
     // Check that service-a has consistent resource attributes across all signal types
     // This validates that our grouping key correctly identifies the same service
 
-    println!("✅ Mixed signal resource attribute grouping test passed!");
-    println!("   - Logs: 2 resource groups (service-a: 3 logs, service-b: 2 logs)");
-    println!("   - Metrics: 2 resource groups (service-a: 2 metrics, service-c: 1 metric)");
-    println!("   - Traces: 2 resource groups (service-a: 2 spans, service-b: 1 span)");
+    // Test passed - mixed signal resource attribute grouping working correctly
+    // - Logs: 2 resource groups (service-a: 3 logs, service-b: 2 logs)
+    // - Metrics: 2 resource groups (service-a: 2 metrics, service-c: 1 metric)
+    // - Traces: 2 resource groups (service-a: 2 spans, service-b: 1 span)
 }

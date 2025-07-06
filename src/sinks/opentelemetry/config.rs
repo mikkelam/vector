@@ -2,6 +2,7 @@
 
 use std::str::FromStr;
 
+use futures::future;
 use http::{Method, Request, Uri};
 
 use crate::{
@@ -73,38 +74,6 @@ pub enum ContentEncoding {
 
 fn default_health_path() -> String {
     "/health".to_string()
-}
-
-/// Healthcheck configuration for the OTLP sink.
-#[configurable_component]
-#[derive(Clone, Debug)]
-pub struct HealthcheckConfig {
-    /// Health endpoint path (relative to base endpoint).
-    ///
-    /// The healthcheck will first try this path, and if it returns 404,
-    /// it will fall back to the root path. Common health paths include
-    /// "/health", "/healthz", and "/status".
-    #[configurable(metadata(docs::examples = "/health"))]
-    #[configurable(metadata(docs::examples = "/healthz"))]
-    #[configurable(metadata(docs::examples = "/status"))]
-    #[serde(default = "default_health_path")]
-    pub path: String,
-
-    /// Skip healthcheck entirely.
-    ///
-    /// This can be useful in environments where healthcheck requests
-    /// are not allowed or cause issues during startup.
-    #[serde(default)]
-    pub skip: bool,
-}
-
-impl Default for HealthcheckConfig {
-    fn default() -> Self {
-        Self {
-            path: default_health_path(),
-            skip: false,
-        }
-    }
 }
 
 /// HTTP transport configuration for OTLP.
@@ -230,14 +199,6 @@ pub struct OpenTelemetryConfig {
     #[configurable(derived)]
     #[serde(default)]
     acknowledgements: AcknowledgementsConfig,
-
-    /// Healthcheck configuration.
-    ///
-    /// Configures how the sink performs healthchecks to verify connectivity
-    /// to the OTLP endpoint before starting to send data.
-    #[configurable(derived)]
-    #[serde(default)]
-    pub healthcheck: HealthcheckConfig,
 }
 
 /// The protocol used to send OTLP data.
@@ -273,7 +234,6 @@ impl Default for OpenTelemetryConfig {
             batch: BatchConfig::default(),
             tls: None,
             acknowledgements: AcknowledgementsConfig::default(),
-            healthcheck: HealthcheckConfig::default(),
         }
     }
 }
@@ -290,13 +250,23 @@ impl SinkConfig for OpenTelemetryConfig {
         let tls_settings = TlsSettings::from_options(self.tls.as_ref())?;
         let client = HttpClient::new(tls_settings, cx.proxy())?;
 
-        let healthcheck = healthcheck(
-            self.endpoint.clone(),
-            self.healthcheck.clone(),
-            self.auth.clone(),
-            client.clone(),
-        )
-        .boxed();
+        let healthcheck = match &cx.healthcheck.uri {
+            Some(healthcheck_uri) => healthcheck(
+                healthcheck_uri.to_string(),
+                default_health_path(),
+                self.auth.clone(),
+                client.clone(),
+            )
+            .boxed(),
+            None if cx.healthcheck.enabled => healthcheck(
+                self.endpoint.clone(),
+                default_health_path(),
+                self.auth.clone(),
+                client.clone(),
+            )
+            .boxed(),
+            None => future::ok(()).boxed(),
+        };
 
         let sink = match self.protocol {
             OtlpProtocol::Http => {
@@ -327,9 +297,9 @@ impl OpenTelemetryConfig {
         let endpoint = UriSerde::from_str(&self.endpoint)?;
 
         // The full paths for each signal type.
-        let logs_endpoint = endpoint.append_path(&self.logs_path.trim_start_matches('/'))?;
-        let traces_endpoint = endpoint.append_path(&self.traces_path.trim_start_matches('/'))?;
-        let metrics_endpoint = endpoint.append_path(&self.metrics_path.trim_start_matches('/'))?;
+        let logs_endpoint = endpoint.append_path(self.logs_path.trim_start_matches('/'))?;
+        let traces_endpoint = endpoint.append_path(self.traces_path.trim_start_matches('/'))?;
+        let metrics_endpoint = endpoint.append_path(self.metrics_path.trim_start_matches('/'))?;
 
         let validated_headers =
             validate_opentelemetry_headers(&self.request.headers, self.auth.is_some())?;
@@ -337,7 +307,7 @@ impl OpenTelemetryConfig {
         let service_builder = OtlpServiceRequestBuilder {
             auth: self.auth.clone(),
             method: self.http.method,
-            compression: self.http.compression.clone(),
+            compression: self.http.compression,
             encoding: self.http.encoding,
             headers: validated_headers,
         };
@@ -346,7 +316,7 @@ impl OpenTelemetryConfig {
             .settings(request_settings, http_response_retry_logic())
             .service(HttpService::new(client, service_builder));
 
-        let request_builder = OtlpRequestBuilder::new(self.http.compression.clone(), self.clone());
+        let request_builder = OtlpRequestBuilder::new(self.http.compression, self.clone());
 
         let sink = OpenTelemetrySink::new(
             service,
@@ -380,32 +350,24 @@ async fn fetch_health_status(
 
 async fn healthcheck(
     endpoint: String,
-    healthcheck_config: HealthcheckConfig,
+    health_path: String,
     auth: Option<Auth>,
     client: HttpClient,
 ) -> crate::Result<()> {
-    if healthcheck_config.skip {
-        return Ok(());
-    }
-
     // Try the configured health endpoint first
-    let health_status =
-        fetch_health_status(&healthcheck_config.path, &endpoint, &auth, &client).await?;
+    let health_status = fetch_health_status(&health_path, &endpoint, &auth, &client).await?;
 
     let status = match health_status {
         http::StatusCode::NOT_FOUND => {
             debug!(
                 "Health endpoint '{}' not found. Trying root path.",
-                healthcheck_config.path
+                health_path
             );
             fetch_health_status("/", &endpoint, &auth, &client).await?
         }
-        status => status,
+        _ => health_status,
     };
 
-    // Accept success responses and client errors (like 404, 405)
-    // Client errors indicate the service is reachable but the endpoint doesn't exist
-    // or doesn't support the method, which is fine for a connectivity check
     match status {
         s if s.is_success() || s.is_client_error() => Ok(()),
         other => Err(HealthcheckError::UnexpectedStatus { status: other }.into()),
@@ -433,45 +395,28 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_healthcheck_config_defaults() {
-        let config = HealthcheckConfig::default();
-        assert_eq!(config.path, "/health");
-        assert!(!config.skip);
-    }
-
-    #[test]
     fn test_opentelemetry_config_defaults() {
         let config = OpenTelemetryConfig::default();
-        assert_eq!(config.healthcheck.path, "/health");
-        assert!(!config.healthcheck.skip);
+        assert_eq!(config.endpoint, "http://localhost:4318");
+        assert_eq!(config.logs_path, "/v1/logs");
+        assert_eq!(config.metrics_path, "/v1/metrics");
+        assert_eq!(config.traces_path, "/v1/traces");
     }
 
     #[test]
-    fn test_healthcheck_config_serialization() {
-        let config_str = r#"
-            skip = true
-            path = "/custom-health"
-        "#;
-
-        let config: HealthcheckConfig = toml::from_str(config_str).unwrap();
-        assert_eq!(config.path, "/custom-health");
-        assert!(config.skip);
-    }
-
-    #[test]
-    fn test_full_config_with_healthcheck() {
+    fn test_full_config_basic() {
         let config_str = r#"
             endpoint = "http://localhost:4318"
-
-            [healthcheck]
-            path = "/status"
-            skip = false
+            logs_path = "/custom/logs"
+            metrics_path = "/custom/metrics"
+            traces_path = "/custom/traces"
         "#;
 
         let config: OpenTelemetryConfig = toml::from_str(config_str).unwrap();
         assert_eq!(config.endpoint, "http://localhost:4318");
-        assert_eq!(config.healthcheck.path, "/status");
-        assert!(!config.healthcheck.skip);
+        assert_eq!(config.logs_path, "/custom/logs");
+        assert_eq!(config.metrics_path, "/custom/metrics");
+        assert_eq!(config.traces_path, "/custom/traces");
     }
 
     #[tokio::test]
@@ -498,7 +443,7 @@ mod tests {
         let service_builder = OtlpServiceRequestBuilder {
             auth: config.auth.clone(),
             method: config.http.method,
-            compression: config.http.compression.clone(),
+            compression: config.http.compression,
             encoding: config.http.encoding,
             headers: validated_headers,
         };

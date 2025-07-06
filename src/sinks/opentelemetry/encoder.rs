@@ -167,7 +167,7 @@ impl ResourceAttributeExtractor for VectorMetric {
             }
 
             for key in &keys_to_remove {
-                tags.remove(&key);
+                tags.remove(key);
             }
         }
     }
@@ -252,7 +252,7 @@ impl OtlpEncoder {
 
     /// Creates a new `OtlpEncoder` with default configuration for testing.
     #[cfg(test)]
-    pub(super) fn new_default() -> Self {
+    pub(super) const fn new_default() -> Self {
         Self {}
     }
 
@@ -436,7 +436,7 @@ impl OtlpEncoder {
                     .for_each(|metric| metric.remove_all_resource_attributes());
 
                 // Apply normalization to convert incremental metrics to absolute
-                let mut normalizer = OtlpMetricNormalize::default();
+                let mut normalizer = OtlpMetricNormalize;
                 let mut metric_state = MetricSet::default();
 
                 let metric_records: Vec<_> = metrics
@@ -495,7 +495,7 @@ impl OtlpEncoder {
         Ok(request.encode_to_vec().into())
     }
 
-    fn create_scope_logs(&self, log_records: Vec<LogRecord>) -> ScopeLogs {
+    const fn create_scope_logs(&self, log_records: Vec<LogRecord>) -> ScopeLogs {
         ScopeLogs {
             scope: None,
             log_records,
@@ -503,7 +503,7 @@ impl OtlpEncoder {
         }
     }
 
-    fn create_scope_metrics(&self, metrics: Vec<OtlpMetric>) -> ScopeMetrics {
+    const fn create_scope_metrics(&self, metrics: Vec<OtlpMetric>) -> ScopeMetrics {
         ScopeMetrics {
             scope: None,
             metrics,
@@ -511,7 +511,7 @@ impl OtlpEncoder {
         }
     }
 
-    fn create_scope_spans(&self, spans: Vec<Span>) -> ScopeSpans {
+    const fn create_scope_spans(&self, spans: Vec<Span>) -> ScopeSpans {
         ScopeSpans {
             scope: None,
             spans,
@@ -546,7 +546,7 @@ impl OtlpEncoder {
         if log
             .get("attributes")
             .and_then(|v| v.as_object())
-            .map_or(false, |obj| obj.is_empty())
+            .is_some_and(|obj| obj.is_empty())
         {
             log.remove("attributes");
         }
@@ -1007,8 +1007,8 @@ fn convert_distribution_to_otlp(
         }
 
         // Increment all buckets up to and including the target bucket
-        for i in bucket_index..bucket_counts.len() {
-            bucket_counts[i] += 1;
+        for bucket_count in bucket_counts.iter_mut().skip(bucket_index) {
+            *bucket_count += 1;
         }
     }
 
@@ -1128,7 +1128,8 @@ fn convert_vector_trace_to_otlp_span(trace: TraceEvent) -> Span {
             "client" => SpanKind::Client as i32,
             "producer" => SpanKind::Producer as i32,
             "consumer" => SpanKind::Consumer as i32,
-            "internal" | _ => SpanKind::Internal as i32,
+            "internal" => SpanKind::Internal as i32,
+            _ => SpanKind::Internal as i32,
         })
         .unwrap_or(SpanKind::Internal as i32);
 
@@ -1136,7 +1137,7 @@ fn convert_vector_trace_to_otlp_span(trace: TraceEvent) -> Span {
         .get("trace_state")
         .and_then(|v| v.as_str())
         .map(|s| s.to_string())
-        .unwrap_or_else(|| "".to_string());
+        .unwrap_or_default();
 
     // Handle timestamps - either direct fields or calculated from timestamp/duration
     let end_time_unix_nano = if let Some(end_time) =
@@ -1223,7 +1224,7 @@ fn convert_vector_trace_to_otlp_span(trace: TraceEvent) -> Span {
         .and_then(|v| v.as_array())
         .map(|arr| {
             arr.iter()
-                .filter_map(|event_val| convert_value_to_span_event(event_val))
+                .filter_map(convert_value_to_span_event)
                 .collect()
         })
         .unwrap_or_default();
@@ -1239,7 +1240,7 @@ fn convert_vector_trace_to_otlp_span(trace: TraceEvent) -> Span {
         .and_then(|v| v.as_array())
         .map(|arr| {
             arr.iter()
-                .filter_map(|link_val| convert_value_to_span_link(link_val))
+                .filter_map(convert_value_to_span_link)
                 .collect()
         })
         .unwrap_or_default();
