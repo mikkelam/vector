@@ -16,8 +16,7 @@ components: sinks: opentelemetry: {
 		acknowledgements: true
 		auto_generated:   true
 		healthcheck: {
-			enabled:  true
-			uses_uri: false
+			enabled: true
 		}
 		send: {
 			batch: {
@@ -33,10 +32,8 @@ components: sinks: opentelemetry: {
 				levels: ["none", "fast", "default", "best", 0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
 			}
 			encoding: {
-				enabled: true
-				codec: enabled: false
+				enabled: false
 			}
-			proxy: enabled: true
 			request: {
 				enabled: true
 				headers: true
