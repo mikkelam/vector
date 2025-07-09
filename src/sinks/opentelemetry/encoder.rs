@@ -120,6 +120,13 @@ impl ResourceAttributeExtractor for LogEvent {
     fn extract_nested_resource_attributes(&mut self) -> Vec<KeyValue> {
         if let Some(resource_map) = self.remove(event_path!("resource")) {
             if let Some(resource_obj) = resource_map.as_object() {
+                // Check if there's an "attributes" key containing the actual attributes
+                if let Some(attributes_value) = resource_obj.get("attributes") {
+                    if let Some(attributes_obj) = attributes_value.as_object() {
+                        return convert_object_map_to_key_value_vec(attributes_obj.clone());
+                    }
+                }
+                // Fallback: treat the entire resource object as attributes
                 return convert_object_map_to_key_value_vec(resource_obj.clone());
             }
         }
@@ -170,59 +177,6 @@ impl ResourceAttributeExtractor for VectorMetric {
                 tags.remove(key);
             }
         }
-    }
-}
-
-impl ResourceAttributeExtractor for TraceEvent {
-    fn extract_resource_attributes(&mut self) -> Vec<KeyValue> {
-        let mut resource_attributes = Vec::new();
-        let mut keys_to_remove = Vec::new();
-
-        for (key_path, value) in self.as_map().iter() {
-            let key = key_path.to_string();
-            if let Some(attr_key) = key.strip_prefix("resources.") {
-                let clean_key = attr_key.trim_matches('"');
-                resource_attributes.push(KeyValue {
-                    key: clean_key.to_string(),
-                    value: Some(convert_value_to_any_value(value.clone())),
-                });
-                keys_to_remove.push(key);
-            }
-        }
-
-        for key in &keys_to_remove {
-            self.remove(key.as_str());
-        }
-
-        resource_attributes
-    }
-
-    fn remove_resource_attributes(&mut self) {
-        let mut keys_to_remove = Vec::new();
-
-        for (key_path, _) in self.as_map().iter() {
-            let key = key_path.to_string();
-            if key.starts_with("resources.") {
-                keys_to_remove.push(key);
-            }
-        }
-
-        for key in &keys_to_remove {
-            self.remove(key.as_str());
-        }
-    }
-
-    fn extract_nested_resource_attributes(&mut self) -> Vec<KeyValue> {
-        if let Some(resource_map) = self.remove(event_path!("resource")) {
-            if let Some(resource_obj) = resource_map.as_object() {
-                return convert_object_map_to_key_value_vec(resource_obj.clone());
-            }
-        }
-        Vec::new()
-    }
-
-    fn remove_nested_resource_attributes(&mut self) {
-        let _ = self.remove(event_path!("resource"));
     }
 }
 
