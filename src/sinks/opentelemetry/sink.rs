@@ -26,7 +26,11 @@ pub(super) struct KeyPartitioner {
 
 impl KeyPartitioner {
     /// Creates a new `KeyPartitioner`.
-    pub const fn new(log_endpoint: String, trace_endpoint: String, metric_endpoint: String) -> Self {
+    pub const fn new(
+        log_endpoint: String,
+        trace_endpoint: String,
+        metric_endpoint: String,
+    ) -> Self {
         Self {
             log_endpoint,
             trace_endpoint,

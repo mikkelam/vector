@@ -1222,11 +1222,7 @@ fn convert_vector_trace_to_otlp_span(trace: TraceEvent) -> Span {
     let events = trace_map
         .get("events")
         .and_then(|v| v.as_array())
-        .map(|arr| {
-            arr.iter()
-                .filter_map(convert_value_to_span_event)
-                .collect()
-        })
+        .map(|arr| arr.iter().filter_map(convert_value_to_span_event).collect())
         .unwrap_or_default();
 
     let dropped_events_count = trace_map
@@ -1238,11 +1234,7 @@ fn convert_vector_trace_to_otlp_span(trace: TraceEvent) -> Span {
     let links = trace_map
         .get("links")
         .and_then(|v| v.as_array())
-        .map(|arr| {
-            arr.iter()
-                .filter_map(convert_value_to_span_link)
-                .collect()
-        })
+        .map(|arr| arr.iter().filter_map(convert_value_to_span_link).collect())
         .unwrap_or_default();
 
     let dropped_links_count = trace_map
