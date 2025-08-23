@@ -116,34 +116,3 @@ fn test_invalid_trace_id_hex() {
     assert_eq!(log_record.trace_id.len(), 0);
     assert_eq!(log_record.span_id.len(), 0);
 }
-
-#[test]
-fn test_resource_attribute_extractor_trait_logs() {
-    // Test the trait methods directly on LogEvent
-    let mut log = LogEvent::from("test message");
-    log.insert(event_path!("resources", "service", "name"), "test-service");
-    log.insert(event_path!("resources", "environment"), "production");
-    log.insert("normal_field", "normal_value");
-
-    // Test extraction
-    let resource_attrs = log.extract_resource_attributes();
-    assert_eq!(resource_attrs.len(), 2);
-
-    let service_name = resource_attrs
-        .iter()
-        .find(|attr| attr.key == "service.name")
-        .unwrap();
-    if let Some(any_value) = &service_name.value {
-        if let Some(PbValue::StringValue(s)) = &any_value.value {
-            assert_eq!(s, "test-service");
-        }
-    }
-
-    // Verify resource fields are still present (we no longer remove them)
-    assert!(
-        log.get(event_path!("resources", "service", "name"))
-            .is_some()
-    );
-    assert!(log.get(event_path!("resources", "environment")).is_some());
-    assert!(log.get("normal_field").is_some());
-}

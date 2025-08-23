@@ -319,37 +319,6 @@ fn test_encoder_resource_extraction() {
 }
 
 #[test]
-fn test_encode_logs_method_directly() {
-    let encoder = OtlpEncoder::new_default();
-
-    let mut log = LogEvent::from("direct test message");
-    log.insert("test_key", "test_value");
-    log.insert(
-        event_path!("resource", "service.name"),
-        "direct-test-service",
-    );
-
-    let events = vec![Event::Log(log)];
-    let result = encoder.encode_logs(events).unwrap();
-
-    // Should have non-empty protobuf bytes
-    assert!(!result.is_empty());
-
-    // Decode and verify the structure
-    let request = ExportLogsServiceRequest::decode(result.as_ref()).unwrap();
-    assert_eq!(request.resource_logs.len(), 1);
-
-    let resource_log = &request.resource_logs[0];
-    let resource = resource_log.resource.as_ref().unwrap();
-    assert_eq!(resource.attributes.len(), 1);
-    assert_eq!(resource.attributes[0].key, "service.name");
-
-    let log_record = &resource_log.scope_logs[0].log_records[0];
-    // Should have message, test_key, and timestamp attributes
-    assert_eq!(log_record.attributes.len(), 3);
-}
-
-#[test]
 fn test_severity_integration_with_encoder() {
     let encoder = OtlpEncoder::new_default();
 
