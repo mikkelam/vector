@@ -1,23 +1,23 @@
 //! Configuration for the `opentelemetry` sink.
 
-use std::str::FromStr;
+use std::{collections::BTreeMap, str::FromStr};
 
 use futures::future;
 use http::{Method, Request, Uri};
 
+use crate::sinks::util::http::OrderedHeaderName;
 use crate::{
     http::{Auth, HttpClient},
     sinks::{
         prelude::*,
         util::{
-            http::{http_response_retry_logic, validate_headers, HttpService, RequestConfig},
-            service::ServiceBuilderExt,
             BatchConfig, Compression, RealtimeSizeBasedDefaultBatchSettings, UriSerde,
+            http::{HttpService, RequestConfig, http_response_retry_logic, validate_headers},
+            service::ServiceBuilderExt,
         },
     },
 };
-use http::{header::AUTHORIZATION, HeaderName, HeaderValue};
-use indexmap::IndexMap;
+use http::{HeaderValue, header::AUTHORIZATION};
 
 use super::{
     request_builder::OtlpRequestBuilder, service::OtlpServiceRequestBuilder,
@@ -376,13 +376,13 @@ async fn healthcheck(
 
 /// Validates headers for OpenTelemetry sink, checking for auth conflicts
 fn validate_opentelemetry_headers(
-    headers: &IndexMap<String, String>,
+    headers: &BTreeMap<String, String>,
     configures_auth: bool,
-) -> crate::Result<IndexMap<HeaderName, HeaderValue>> {
+) -> crate::Result<BTreeMap<OrderedHeaderName, HeaderValue>> {
     let headers = validate_headers(headers)?;
 
     for name in headers.keys() {
-        if configures_auth && name == AUTHORIZATION {
+        if configures_auth && name.inner() == AUTHORIZATION {
             return Err("Authorization header cannot be used with defined auth options".into());
         }
     }
@@ -496,10 +496,12 @@ mod tests {
         // This should fail validation
         let result = validate_opentelemetry_headers(&config.request.headers, config.auth.is_some());
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("Authorization header cannot be used with defined auth options"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("Authorization header cannot be used with defined auth options")
+        );
     }
 
     #[tokio::test]
