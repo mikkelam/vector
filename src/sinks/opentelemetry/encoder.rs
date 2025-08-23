@@ -14,7 +14,7 @@ use vector_lib::opentelemetry::proto::{
     collector::metrics::v1::ExportMetricsServiceRequest,
     collector::trace::v1::ExportTraceServiceRequest,
     common::v1::{any_value::Value as PbValue, AnyValue, KeyValue, KeyValueList},
-    logs::v1::{LogRecord, ResourceLogs, ScopeLogs, SeverityNumber},
+    logs::v1::{LogRecord, ResourceLogs, ScopeLogs},
     metrics::v1::{
         metric::Data, number_data_point::Value as NumberDataPointValue,
         summary_data_point::ValueAtQuantile, AggregationTemporality, Gauge, Histogram,
@@ -81,7 +81,17 @@ impl OtlpEncoder {
             .into_iter()
             .map(|e| {
                 let mut log = e.into_log();
-                let resource_attrs = log.extract_all_resource_attributes();
+
+                // Extract resources before converting to log record
+                let resource_attrs = if let Some(resources) = log.remove(event_path!("resources")) {
+                    if let Value::Object(map) = resources {
+                        convert_object_map_to_key_value_vec(map)
+                    } else {
+                        Vec::new()
+                    }
+                } else {
+                    Vec::new()
+                };
 
                 ResourceLogs {
                     resource: Some(Resource {
@@ -103,92 +113,108 @@ impl OtlpEncoder {
 
     /// Converts a single Vector `LogEvent` into an OTLP `LogRecord`.
     fn convert_log_event_to_log_record(&self, mut log: LogEvent) -> LogRecord {
-        let body = log
-            .get_message()
-            .map(|msg| convert_value_to_any_value(msg.clone()));
+        let mut log_record = LogRecord::default();
 
-        let time_unix_nano = log
-            .get_timestamp()
-            .and_then(|v| v.as_timestamp())
-            .and_then(|ts| ts.timestamp_nanos_opt())
-            .unwrap_or(0) as u64;
-
-        // Value of 0 indicates unknown or missing timestamp
-        let observed_time_unix_nano = log
-            .remove(event_path!("observed_timestamp"))
-            .and_then(|v| v.as_timestamp().copied())
-            .and_then(|ts| ts.timestamp_nanos_opt())
-            .map(|ns| ns as u64)
-            .unwrap_or(0);
-
-        let trace_id = log
-            .remove(event_path!("trace_id"))
-            .and_then(|v| {
-                // Vector's OTLP source stores trace_id as hex string, decode it back to bytes
-                if let Some(hex_str) = v.as_str() {
-                    hex::decode(hex_str.as_ref())
-                        .ok()
-                        .filter(|bytes| bytes.len() == 16)
-                } else if let Some(bytes) = v.as_bytes() {
-                    // Raw bytes
-                    Some(bytes.to_vec()).filter(|bytes| bytes.len() == 16)
-                } else if let Some(array) = v.as_array() {
-                    // Array of integers (converted to bytes)
-                    let bytes: Result<Vec<u8>, _> = array
-                        .iter()
-                        .map(|v| v.as_integer().and_then(|i| u8::try_from(i).ok()))
-                        .collect::<Option<Vec<u8>>>()
-                        .ok_or(());
-                    bytes.ok().filter(|bytes| bytes.len() == 16)
-                } else {
-                    None
-                }
-            })
-            .unwrap_or_default();
-
-        let span_id = log
-            .remove(event_path!("span_id"))
-            .and_then(|v| {
-                // Vector's OTLP source stores span_id as hex string, decode it back to bytes
-                if let Some(hex_str) = v.as_str() {
-                    hex::decode(hex_str.as_ref())
-                        .ok()
-                        .filter(|bytes| bytes.len() == 8)
-                } else if let Some(bytes) = v.as_bytes() {
-                    // Raw bytes
-                    Some(bytes.to_vec()).filter(|bytes| bytes.len() == 8)
-                } else if let Some(array) = v.as_array() {
-                    // Array of integers (converted to bytes)
-                    let bytes: Result<Vec<u8>, _> = array
-                        .iter()
-                        .map(|v| v.as_integer().and_then(|i| u8::try_from(i).ok()))
-                        .collect::<Option<Vec<u8>>>()
-                        .ok_or(());
-                    bytes.ok().filter(|bytes| bytes.len() == 8)
-                } else {
-                    None
-                }
-            })
-            .unwrap_or_default();
-
-        // Extract severity information
-        let (severity_number, severity_text) = extract_severity(&mut log);
-
-        // Extract attributes from flattened fields (attributes.*) and remaining fields
-        let attributes = self.extract_log_attributes(&mut log);
-
-        LogRecord {
-            time_unix_nano,
-            observed_time_unix_nano,
-            severity_number,
-            severity_text,
-            body,
-            attributes,
-            dropped_attributes_count: 0,
-            flags: 0,
-            trace_id,
-            span_id,
+        // Handle body/message
+        if let Some(msg) = log.get_message() {
+            log_record.body = Some(convert_value_to_any_value(msg.clone()));
         }
+
+        // Handle timestamp
+        if let Some(Value::Timestamp(timestamp)) = log.get_timestamp() {
+            log_record.time_unix_nano = timestamp.timestamp_nanos_opt().unwrap_or(0) as u64;
+        }
+
+        // Handle observed timestamp
+        if let Some(Value::Timestamp(timestamp)) = log.remove(event_path!("observed_timestamp")) {
+            log_record.observed_time_unix_nano =
+                timestamp.timestamp_nanos_opt().unwrap_or(0) as u64;
+        }
+
+        // Handle trace_id
+        if let Some(trace_id) = log.remove(event_path!("trace_id")) {
+            match trace_id {
+                Value::Bytes(bytes) => {
+                    if bytes.len() == 16 {
+                        log_record.trace_id = bytes.into();
+                    } else if let Ok(decoded) = hex::decode(bytes.as_ref()) {
+                        if decoded.len() == 16 {
+                            log_record.trace_id = decoded;
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        // Handle span_id
+        if let Some(span_id) = log.remove(event_path!("span_id")) {
+            match span_id {
+                Value::Bytes(bytes) => {
+                    if bytes.len() == 8 {
+                        log_record.span_id = bytes.into();
+                    } else if let Ok(decoded) = hex::decode(bytes.as_ref()) {
+                        if decoded.len() == 8 {
+                            log_record.span_id = decoded;
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        // Handle severity
+        if let Some(severity_text) = log.remove(event_path!("severity_text")) {
+            if let Value::Bytes(text) = severity_text {
+                log_record.severity_text = String::from_utf8_lossy(&text).to_string();
+            }
+        }
+
+        if let Some(severity_number) = log.remove(event_path!("severity_number")) {
+            if let Value::Integer(num) = severity_number {
+                log_record.severity_number = num as i32;
+            }
+        }
+
+        // Handle flags
+        if let Some(flags) = log.remove(event_path!("flags")) {
+            if let Value::Integer(f) = flags {
+                log_record.flags = f as u32;
+            }
+        }
+
+        // Handle dropped_attributes_count
+        if let Some(count) = log.remove(event_path!("dropped_attributes_count")) {
+            if let Value::Integer(c) = count {
+                log_record.dropped_attributes_count = c as u32;
+            }
+        }
+
+        // Handle attributes
+        if let Some(attrs) = log.remove(event_path!("attributes")) {
+            match attrs {
+                Value::Object(map) => {
+                    log_record
+                        .attributes
+                        .extend(convert_object_map_to_key_value_vec(map));
+                }
+                _ => {}
+            }
+        }
+
+        // Remove core Vector fields that shouldn't be attributes
+        log.remove(event_path!("message"));
+        log.remove(event_path!("timestamp"));
+        log.remove(event_path!("source_type"));
+
+        // Convert remaining fields to attributes
+        if let Some(map) = log.as_map() {
+            log_record
+                .attributes
+                .extend(convert_object_map_to_key_value_vec(map.clone()));
+        }
+
+        log_record
     }
 
     /// Encodes a batch of metric events into an `ExportMetricsServiceRequest` Protobuf message.
@@ -270,64 +296,6 @@ impl OtlpEncoder {
             schema_url: String::new(),
         }
     }
-
-    /// Extracts log record attributes from flattened fields and remaining fields.
-    fn extract_log_attributes(&self, log: &mut LogEvent) -> Vec<KeyValue> {
-        let mut attributes = Vec::new();
-        let mut keys_to_remove = Vec::new();
-
-        // Extract flattened attribute fields with "attributes." prefix
-        // Use all_event_fields() to handle both top-level and nested fields
-        for (key, value) in log.all_event_fields().unwrap() {
-            if let Some(attr_key) = key.strip_prefix("attributes.") {
-                attributes.push(KeyValue {
-                    key: attr_key.to_string(),
-                    value: Some(convert_value_to_any_value(value.clone())),
-                });
-                keys_to_remove.push(key.clone());
-            }
-        }
-
-        // Remove the flattened attribute fields
-        for key in &keys_to_remove {
-            log.remove(key.as_str());
-        }
-
-        // Clean up empty parent objects that may have been left behind
-        if log
-            .get("attributes")
-            .and_then(|v| v.as_object())
-            .is_some_and(|obj| obj.is_empty())
-        {
-            log.remove("attributes");
-        }
-
-        // Add remaining fields as attributes (excluding core OTLP fields that have dedicated protobuf fields)
-        let remaining_fields: ObjectMap = log
-            .all_event_fields()
-            .unwrap()
-            .filter(|(key, _)| {
-                !matches!(
-                    key.as_str(),
-                    "severity_number"
-                        | "severity_text"
-                        | "trace_id"
-                        | "span_id"
-                        | "observed_timestamp"
-                        | "source_type"
-                        | "flags"
-                        | "dropped_attributes_count"
-                        | "attributes"
-                        | "resources"
-                ) && !key.starts_with("resource.")
-                    && !key.starts_with("attributes.")
-            })
-            .map(|(k, v)| (k.clone(), v.clone()))
-            .collect();
-
-        attributes.extend(convert_object_map_to_key_value_vec(remaining_fields));
-        attributes
-    }
 }
 
 impl crate::sinks::util::encoding::Encoder<Vec<Event>> for OtlpEncoder {
@@ -390,36 +358,17 @@ trait ResourceAttributeExtractor {
 
 impl ResourceAttributeExtractor for LogEvent {
     fn extract_resource_attributes(&mut self) -> Vec<KeyValue> {
-        let mut resource_attributes = Vec::new();
-
-        // Use all_event_fields() to get flattened representation including nested fields
-        // When fields are inserted with dot notation (e.g., "resource.environment"),
-        // Vector creates nested structures, so we need the flattened view to find them
-        for (key, value) in self.all_event_fields().unwrap() {
-            if let Some(attr_key) = key.strip_prefix("resource.") {
-                resource_attributes.push(KeyValue {
-                    key: attr_key.to_string(),
-                    value: Some(convert_value_to_any_value(value.clone())),
-                });
+        // Extract resource attributes from nested "resources" object
+        if let Some(resources) = self.remove(event_path!("resources")) {
+            if let Value::Object(map) = resources {
+                return convert_object_map_to_key_value_vec(map);
             }
         }
-
-        resource_attributes
+        Vec::new()
     }
 
     fn extract_nested_resource_attributes(&mut self) -> Vec<KeyValue> {
-        if let Some(resource_map) = self.get(event_path!("resource")) {
-            if let Some(resource_obj) = resource_map.as_object() {
-                // Check if there's an "attributes" key containing the actual attributes
-                if let Some(attributes_value) = resource_obj.get("attributes") {
-                    if let Some(attributes_obj) = attributes_value.as_object() {
-                        return convert_object_map_to_key_value_vec(attributes_obj.clone());
-                    }
-                }
-                // Fallback: treat the entire resource object as attributes
-                return convert_object_map_to_key_value_vec(resource_obj.clone());
-            }
-        }
+        // This is now handled by extract_resource_attributes
         Vec::new()
     }
 }
@@ -519,131 +468,6 @@ fn convert_object_map_to_key_value_vec(map: ObjectMap) -> Vec<KeyValue> {
             value: Some(convert_value_to_any_value(value)),
         })
         .collect()
-}
-
-/// Extract severity number and text from a log event.
-///
-/// This function looks for common severity/level fields and maps them to OTLP severity values.
-/// It removes the severity fields from the log so they don't appear as attributes.
-pub(super) fn extract_severity(log: &mut LogEvent) -> (i32, String) {
-    // Try common field names for severity/level
-    let severity_fields = [
-        "level",
-        "severity",
-        "severity_text",
-        "log_level",
-        "priority",
-    ];
-
-    for field_name in &severity_fields {
-        if let Some(severity_value) = log.get(*field_name) {
-            let result = map_severity_to_otlp(severity_value.clone());
-
-            // Clean up severity fields: keep "level" as attribute, remove others
-            for cleanup_field in &severity_fields {
-                if *cleanup_field != "level" {
-                    log.remove(*cleanup_field);
-                }
-            }
-
-            return result;
-        }
-    }
-
-    // Default to unspecified if no severity field found
-    (SeverityNumber::Unspecified as i32, String::new())
-}
-
-/// Map a Vector Value to OTLP severity number and text.
-pub(super) fn map_severity_to_otlp(value: Value) -> (i32, String) {
-    let severity_str = match &value {
-        Value::Bytes(b) => String::from_utf8_lossy(b).to_lowercase(),
-        Value::Integer(i) => {
-            // Handle numeric severity levels (0-7 syslog style or direct OTLP numbers)
-            return map_numeric_severity(*i);
-        }
-        other => other.to_string_lossy().to_lowercase(),
-    };
-
-    let severity_text = severity_str.to_uppercase();
-
-    let severity_number = match severity_str.as_str() {
-        // TRACE levels (1-4)
-        "trace" | "finest" => SeverityNumber::Trace,
-        "trace1" => SeverityNumber::Trace,
-        "trace2" => SeverityNumber::Trace2,
-        "trace3" => SeverityNumber::Trace3,
-        "trace4" => SeverityNumber::Trace4,
-
-        // DEBUG levels (5-8)
-        "debug" | "fine" => SeverityNumber::Debug,
-        "debug1" => SeverityNumber::Debug,
-        "debug2" => SeverityNumber::Debug2,
-        "debug3" => SeverityNumber::Debug3,
-        "debug4" => SeverityNumber::Debug4,
-
-        // INFO levels (9-12)
-        "info" | "information" | "notice" => SeverityNumber::Info,
-        "info1" => SeverityNumber::Info,
-        "info2" => SeverityNumber::Info2,
-        "info3" => SeverityNumber::Info3,
-        "info4" => SeverityNumber::Info4,
-
-        // WARN levels (13-16)
-        "warn" | "warning" => SeverityNumber::Warn,
-        "warn1" => SeverityNumber::Warn,
-        "warn2" => SeverityNumber::Warn2,
-        "warn3" => SeverityNumber::Warn3,
-        "warn4" => SeverityNumber::Warn4,
-
-        // ERROR levels (17-20)
-        "error" | "err" => SeverityNumber::Error,
-        "error1" => SeverityNumber::Error,
-        "error2" => SeverityNumber::Error2,
-        "error3" => SeverityNumber::Error3,
-        "error4" => SeverityNumber::Error4,
-
-        // FATAL levels (21-24)
-        "fatal" | "critical" | "crit" | "emergency" | "emerg" | "panic" => SeverityNumber::Fatal,
-        "fatal1" => SeverityNumber::Fatal,
-        "fatal2" => SeverityNumber::Fatal2,
-        "fatal3" => SeverityNumber::Fatal3,
-        "fatal4" => SeverityNumber::Fatal4,
-
-        // Default to unspecified for unknown levels
-        _ => SeverityNumber::Unspecified,
-    };
-
-    (severity_number as i32, severity_text)
-}
-
-/// Map numeric severity values to OTLP severity.
-/// Handles both syslog-style (0-7) and direct OTLP numbering (1-24).
-fn map_numeric_severity(level: i64) -> (i32, String) {
-    match level {
-        // Syslog style (RFC 5424) - prioritize these first since they're 0-7
-        0 => (SeverityNumber::Fatal as i32, "EMERGENCY".to_string()),
-        1 => (SeverityNumber::Fatal as i32, "ALERT".to_string()),
-        2 => (SeverityNumber::Fatal as i32, "CRITICAL".to_string()),
-        3 => (SeverityNumber::Error as i32, "ERROR".to_string()),
-        4 => (SeverityNumber::Warn as i32, "WARNING".to_string()),
-        5 => (SeverityNumber::Info as i32, "NOTICE".to_string()),
-        6 => (SeverityNumber::Info as i32, "INFO".to_string()),
-        7 => (SeverityNumber::Debug as i32, "DEBUG".to_string()),
-
-        // Direct OTLP numeric levels (8-24, avoiding syslog overlap)
-        8 => (level as i32, "DEBUG".to_string()),
-        9..=12 => (level as i32, "INFO".to_string()),
-        13..=16 => (level as i32, "WARN".to_string()),
-        17..=20 => (level as i32, "ERROR".to_string()),
-        21..=24 => (level as i32, "FATAL".to_string()),
-
-        // Out of range - default to unspecified
-        _ => (
-            SeverityNumber::Unspecified as i32,
-            format!("LEVEL_{}", level),
-        ),
-    }
 }
 
 /// Converts a Vector Metric into an OTLP Metric.
@@ -1213,13 +1037,84 @@ fn convert_value_to_span_link(value: &Value) -> Option<Link> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::event::{LogEvent, TraceEvent};
     use crate::sinks::util::encoding::Encoder;
     use std::collections::BTreeMap;
-    use vector_lib::opentelemetry::proto::{
-        collector::trace::v1::ExportTraceServiceRequest, common::v1::any_value,
-        trace::v1::span::SpanKind,
-    };
+    use vector_lib::event::{Event, LogEvent};
+    use vector_lib::opentelemetry::proto::common::v1::any_value;
+    use vrl::value::ObjectMap;
+
+    #[test]
+    fn test_key_quoting_behavior() {
+        use prost::Message;
+        use vector_lib::opentelemetry::proto::collector::logs::v1::ExportLogsServiceRequest;
+
+        let encoder = OtlpEncoder::new_default();
+
+        // Test 1: Flat key with dots (should trigger quoting issue)
+        let mut log1 = LogEvent::default();
+        log1.insert("code.file.path", "/path/to/file.py");
+        log1.insert("code.function.name", "my_function");
+        log1.insert("message", "test log");
+
+        // Test 2: Nested structure
+        let mut log2 = LogEvent::default();
+        let mut code_attrs = ObjectMap::new();
+        code_attrs.insert("file.path".into(), Value::from("/path/to/file.py"));
+        code_attrs.insert("function.name".into(), Value::from("my_function"));
+        log2.insert("attributes", Value::Object(code_attrs));
+        log2.insert("message", "test log nested");
+
+        // Test 3: Resource attributes with dots
+        let mut log3 = LogEvent::default();
+        log3.insert("resource.service.name", "test-service");
+        log3.insert("resource.host.name", "test-host");
+        log3.insert("message", "test log resource");
+
+        let events = vec![Event::Log(log1), Event::Log(log2), Event::Log(log3)];
+        let result = encoder.encode_logs(events).unwrap();
+
+        // Decode and inspect the result
+        let request = ExportLogsServiceRequest::decode(result.as_ref()).unwrap();
+
+        println!("=== ENCODED OTLP REQUEST ===");
+        for (i, resource_log) in request.resource_logs.iter().enumerate() {
+            println!("ResourceLog {}: ", i);
+            if let Some(resource) = &resource_log.resource {
+                println!("  Resource attributes:");
+                for attr in &resource.attributes {
+                    println!("    Key: {:?} = {:?}", attr.key, attr.value);
+                }
+            }
+
+            for scope_log in &resource_log.scope_logs {
+                for (j, log_record) in scope_log.log_records.iter().enumerate() {
+                    println!("  LogRecord {}: ", j);
+                    println!("    Log attributes:");
+                    for attr in &log_record.attributes {
+                        println!("      Key: {:?} = {:?}", attr.key, attr.value);
+                    }
+                }
+            }
+        }
+
+        // Check for quoted keys in attributes
+        let mut found_quoted_keys = Vec::new();
+        for resource_log in &request.resource_logs {
+            for scope_log in &resource_log.scope_logs {
+                for log_record in &scope_log.log_records {
+                    for attr in &log_record.attributes {
+                        if attr.key.starts_with('"') && attr.key.ends_with('"') {
+                            found_quoted_keys.push(attr.key.clone());
+                        }
+                    }
+                }
+            }
+        }
+
+        if !found_quoted_keys.is_empty() {
+            panic!("Found quoted keys in OTLP output: {:?}", found_quoted_keys);
+        }
+    }
 
     #[test]
     fn test_trace_id_hex_decoding() {
@@ -1269,136 +1164,6 @@ mod tests {
         // Should result in empty arrays for missing data
         assert_eq!(log_record.trace_id.len(), 0);
         assert_eq!(log_record.span_id.len(), 0);
-    }
-
-    #[test]
-    fn test_hex_strings_from_source() {
-        let encoder = OtlpEncoder::new_default();
-
-        let mut log = LogEvent::from("test message");
-        // Insert hex strings as they come from Vector's OTLP source (legacy namespace)
-        log.insert("trace_id", "4ac52aadf321c2e531db005df08792f5"); // 32-char hex = 16 bytes
-        log.insert("span_id", "0b9e4bda2a55530d"); // 16-char hex = 8 bytes
-
-        let log_record = encoder.convert_log_event_to_log_record(log);
-
-        // Should decode hex strings to proper byte lengths
-        assert_eq!(log_record.trace_id.len(), 16);
-        assert_eq!(log_record.span_id.len(), 8);
-
-        // Verify actual decoded bytes match expected
-        assert_eq!(
-            log_record.trace_id,
-            hex::decode("4ac52aadf321c2e531db005df08792f5").unwrap()
-        );
-        assert_eq!(log_record.span_id, hex::decode("0b9e4bda2a55530d").unwrap());
-    }
-
-    #[test]
-    fn test_flattened_otlp_structure() {
-        let encoder = OtlpEncoder::new_default();
-
-        // Create log event with flattened OTLP structure as Vector's source provides
-        let mut log = LogEvent::from("Processing DELETE /api/orders/789");
-
-        // Resource attributes (flattened with resource. prefix)
-        log.insert(event_path!("resource", "deployment", "environment"), "test");
-        log.insert(event_path!("resource", "host", "name"), "test-host");
-        log.insert(
-            event_path!("resource", "service", "name"),
-            "otel-test-generator",
-        );
-        log.insert(event_path!("resource", "service", "version"), "1.0.0");
-
-        // Log record attributes (flattened with attributes. prefix)
-        log.insert(
-            event_path!("attributes", "code", "file", "path"),
-            "/home/user/generate_otel_signals.py",
-        );
-        log.insert(
-            event_path!("attributes", "code", "function", "name"),
-            "generate_request_trace",
-        );
-        log.insert(event_path!("attributes", "http", "method"), "DELETE");
-        log.insert(event_path!("attributes", "request", "id"), "req_497271");
-
-        // Other log fields
-        log.insert("severity_number", 9);
-        log.insert("level", "INFO");
-
-        let events = vec![Event::Log(log)];
-        let result = encoder.encode_logs(events).unwrap();
-
-        // Decode the protobuf to verify structure
-        use prost::Message;
-        use vector_lib::opentelemetry::proto::collector::logs::v1::ExportLogsServiceRequest;
-
-        let request = ExportLogsServiceRequest::decode(result.as_ref()).unwrap();
-        let resource_logs = &request.resource_logs[0];
-        let resource = resource_logs.resource.as_ref().unwrap();
-        let log_record = &resource_logs.scope_logs[0].log_records[0];
-
-        // Verify resource attributes are properly extracted and structured
-        let resource_attrs: std::collections::HashMap<String, String> = resource
-            .attributes
-            .iter()
-            .map(|kv| {
-                let value = kv.value.as_ref().unwrap().value.as_ref().unwrap();
-                if let vector_lib::opentelemetry::proto::common::v1::any_value::Value::StringValue(
-                    s,
-                ) = value
-                {
-                    (kv.key.clone(), s.clone())
-                } else {
-                    (kv.key.clone(), "".to_string())
-                }
-            })
-            .collect();
-
-        assert_eq!(
-            resource_attrs.get("deployment.environment"),
-            Some(&"test".to_string())
-        );
-        assert_eq!(
-            resource_attrs.get("service.name"),
-            Some(&"otel-test-generator".to_string())
-        );
-        assert_eq!(
-            resource_attrs.get("host.name"),
-            Some(&"test-host".to_string())
-        );
-
-        // Verify log record attributes are properly extracted
-        let log_attrs: std::collections::HashMap<String, String> = log_record
-            .attributes
-            .iter()
-            .map(|kv| {
-                let value = kv.value.as_ref().unwrap().value.as_ref().unwrap();
-                if let vector_lib::opentelemetry::proto::common::v1::any_value::Value::StringValue(
-                    s,
-                ) = value
-                {
-                    (kv.key.clone(), s.clone())
-                } else {
-                    (kv.key.clone(), "".to_string())
-                }
-            })
-            .collect();
-
-        // Check attributes are properly extracted
-        assert!(
-            log_attrs.contains_key("code.file.path")
-                || log_attrs.contains_key("code.function.name")
-        );
-        assert_eq!(log_attrs.get("http.method"), Some(&"DELETE".to_string()));
-        assert_eq!(log_attrs.get("request.id"), Some(&"req_497271".to_string()));
-
-        // Verify other fields are preserved as log attributes (not flattened with prefixes)
-        assert_eq!(log_attrs.get("level"), Some(&"INFO".to_string()));
-
-        // Verify severity is properly extracted (not in attributes)
-        assert_eq!(log_record.severity_number, 9);
-        assert!(!log_attrs.contains_key("severity_number"));
     }
 
     #[test]
