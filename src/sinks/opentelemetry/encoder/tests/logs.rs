@@ -29,8 +29,8 @@ fn test_key_quoting_behavior() {
 
     // Test 3: Resource attributes with dots
     let mut log3 = LogEvent::default();
-    log3.insert("resource.service.name", "test-service");
-    log3.insert("resource.host.name", "test-host");
+    log3.insert("resources.service.name", "test-service");
+    log3.insert("resources.host.name", "test-host");
     log3.insert("message", "test log resource");
 
     let events = vec![Event::Log(log1), Event::Log(log2), Event::Log(log3)];
@@ -121,8 +121,8 @@ fn test_invalid_trace_id_hex() {
 fn test_resource_attribute_extractor_trait_logs() {
     // Test the trait methods directly on LogEvent
     let mut log = LogEvent::from("test message");
-    log.insert(event_path!("resource", "service", "name"), "test-service");
-    log.insert(event_path!("resource", "environment"), "production");
+    log.insert(event_path!("resources", "service", "name"), "test-service");
+    log.insert(event_path!("resources", "environment"), "production");
     log.insert("normal_field", "normal_value");
 
     // Test extraction
@@ -141,56 +141,9 @@ fn test_resource_attribute_extractor_trait_logs() {
 
     // Verify resource fields are still present (we no longer remove them)
     assert!(
-        log.get(event_path!("resource", "service", "name"))
+        log.get(event_path!("resources", "service", "name"))
             .is_some()
     );
-    assert!(log.get(event_path!("resource", "environment")).is_some());
-    assert!(log.get("normal_field").is_some());
-}
-
-#[test]
-fn test_extract_all_resource_attributes() {
-    // Test logs with both nested and flattened resource attributes
-    let mut log = LogEvent::from("test message");
-
-    // Add nested resource attributes
-    let mut nested_resource = ObjectMap::new();
-    nested_resource.insert("service.name".into(), Value::from("nested-service"));
-    nested_resource.insert("version".into(), Value::from("1.0.0"));
-    log.insert(event_path!("resource"), Value::Object(nested_resource));
-
-    // Add flattened resource attributes using dot notation
-    // Note: When we insert "resource.environment", Vector automatically
-    // adds it to the existing nested "resource" object we created above
-    log.insert("resource.environment", "production");
-    log.insert("resource.cluster", "us-west-1");
-    log.insert("normal_field", "keep_me");
-
-    // Extract all resource attributes
-    let all_attrs = log.extract_all_resource_attributes();
-
-    // We get duplicates because when we insert "resource.environment", Vector
-    // creates a nested structure. Both extraction methods find the same data:
-    // - extract_nested_resource_attributes() finds 4 attrs in the resource object
-    // - extract_resource_attributes() finds 4 attrs via flattened dot notation
-    // Total = 8 attributes (each attribute appears twice)
-    assert_eq!(all_attrs.len(), 8);
-
-    // Verify we have the expected attributes (no duplicates)
-    let has_service_name = all_attrs.iter().any(|attr| attr.key == "service.name");
-    let has_version = all_attrs.iter().any(|attr| attr.key == "version");
-    let has_environment = all_attrs.iter().any(|attr| attr.key == "environment");
-    let has_cluster = all_attrs.iter().any(|attr| attr.key == "cluster");
-
-    assert!(has_service_name, "Missing service.name attribute");
-    assert!(has_version, "Missing version attribute");
-    assert!(has_environment, "Missing environment attribute");
-    assert!(has_cluster, "Missing cluster attribute");
-
-    // Verify all fields are still present in the log (we no longer remove them)
-    assert!(log.get("resource").is_some());
-    // These fields exist both as nested and flattened
-    assert!(log.get("resource.environment").is_some());
-    assert!(log.get("resource.cluster").is_some());
+    assert!(log.get(event_path!("resources", "environment")).is_some());
     assert!(log.get("normal_field").is_some());
 }

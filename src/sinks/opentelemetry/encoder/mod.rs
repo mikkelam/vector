@@ -89,17 +89,7 @@ impl OtlpEncoder {
             .map(|e| {
                 let mut log = e.into_log();
 
-                // Extract resources before converting to log record
-                let resource_attrs = if let Some(resources) = log.remove(event_path!(RESOURCE_KEY))
-                {
-                    if let Value::Object(map) = resources {
-                        convert_object_map_to_key_value_vec(map)
-                    } else {
-                        Vec::new()
-                    }
-                } else {
-                    Vec::new()
-                };
+                let resource_attrs = log.extract_resource_attributes();
 
                 ResourceLogs {
                     resource: Some(Resource {
@@ -367,21 +357,22 @@ trait ResourceAttributeExtractor {
 impl ResourceAttributeExtractor for LogEvent {
     fn extract_resource_attributes(&mut self) -> Vec<KeyValue> {
         // Extract resource attributes from nested "resources" object
-        if let Some(resources) = self.remove(event_path!("resources")) {
+        let resource_attrs = if let Some(resources) = self.remove(event_path!(RESOURCE_KEY)) {
             if let Value::Object(map) = resources {
-                return convert_object_map_to_key_value_vec(map);
+                convert_object_map_to_key_value_vec(map)
+            } else {
+                Vec::new()
             }
-        }
-        Vec::new()
-    }
+        } else {
+            Vec::new()
+        };
 
-    fn extract_nested_resource_attributes(&mut self) -> Vec<KeyValue> {
-        // This is now handled by extract_resource_attributes
-        Vec::new()
+        resource_attrs
     }
 }
 
 impl ResourceAttributeExtractor for VectorMetric {
+    // mirrors how we serialize resource attributes in lib/opentelemetry-proto/src/metrics.rs
     fn extract_resource_attributes(&mut self) -> Vec<KeyValue> {
         let mut resource_attributes = Vec::new();
 
@@ -390,7 +381,9 @@ impl ResourceAttributeExtractor for VectorMetric {
                 if let Some(attr_key) = key.strip_prefix("resource.") {
                     resource_attributes.push(KeyValue {
                         key: attr_key.to_string(),
-                        value: Some(convert_value_to_any_value(Value::from(value.to_string()))),
+                        value: Some(AnyValue {
+                            value: Some(PbValue::StringValue(value.to_string())),
+                        }),
                     });
                 }
             }
@@ -402,35 +395,18 @@ impl ResourceAttributeExtractor for VectorMetric {
 
 impl ResourceAttributeExtractor for TraceEvent {
     fn extract_resource_attributes(&mut self) -> Vec<KeyValue> {
-        let mut resource_attributes = Vec::new();
-
-        for (key, value) in self.as_map().iter() {
-            let key_str = key.to_string();
-            if let Some(attr_key) = key_str.strip_prefix("resource.") {
-                resource_attributes.push(KeyValue {
-                    key: attr_key.to_string(),
-                    value: Some(convert_value_to_any_value(value.clone())),
-                });
+        // Extract resource attributes from nested "resources" object
+        let resource_attrs = if let Some(resources) = self.remove(event_path!(RESOURCE_KEY)) {
+            if let Value::Object(map) = resources {
+                convert_object_map_to_key_value_vec(map)
+            } else {
+                Vec::new()
             }
-        }
+        } else {
+            Vec::new()
+        };
 
-        resource_attributes
-    }
-
-    fn extract_nested_resource_attributes(&mut self) -> Vec<KeyValue> {
-        if let Some(resource_map) = self.get(event_path!("resource")) {
-            if let Some(resource_obj) = resource_map.as_object() {
-                // Check if there's an "attributes" key containing the actual attributes
-                if let Some(attributes_value) = resource_obj.get("attributes") {
-                    if let Some(attributes_obj) = attributes_value.as_object() {
-                        return convert_object_map_to_key_value_vec(attributes_obj.clone());
-                    }
-                }
-                // Fallback: treat the entire resource object as attributes
-                return convert_object_map_to_key_value_vec(resource_obj.clone());
-            }
-        }
-        Vec::new()
+        resource_attrs
     }
 }
 
