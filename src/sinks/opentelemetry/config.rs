@@ -421,10 +421,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_custom_headers_applied() {
-        use http::HeaderName;
-        use indexmap::IndexMap;
-
-        let mut headers = IndexMap::new();
+        let mut headers = BTreeMap::new();
         headers.insert("X-Custom-Header".to_string(), "custom-value".to_string());
         headers.insert("X-Another-Header".to_string(), "another-value".to_string());
 
@@ -450,8 +447,10 @@ mod tests {
 
         assert_eq!(service_builder.headers.len(), 2);
 
-        let custom_header = HeaderName::from_static("x-custom-header");
-        let another_header = HeaderName::from_static("x-another-header");
+        let custom_header =
+            OrderedHeaderName::new(headers::HeaderName::from_static("x-custom-header"));
+        let another_header =
+            OrderedHeaderName::new(headers::HeaderName::from_static("x-another-header"));
 
         assert!(service_builder.headers.contains_key(&custom_header));
         assert!(service_builder.headers.contains_key(&another_header));
@@ -478,7 +477,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_auth_header_conflict_validation() {
-        let mut headers = IndexMap::new();
+        let mut headers = BTreeMap::new();
         headers.insert("Authorization".to_string(), "Bearer token123".to_string());
 
         let config = OpenTelemetryConfig {
@@ -506,7 +505,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_auth_header_without_auth_config_is_valid() {
-        let mut headers = IndexMap::new();
+        let mut headers = BTreeMap::new();
         headers.insert("Authorization".to_string(), "Bearer token123".to_string());
 
         let config = OpenTelemetryConfig {
@@ -526,7 +525,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_sink_build_with_custom_headers() {
-        let mut headers = IndexMap::new();
+        let mut headers = BTreeMap::new();
         headers.insert("X-Custom-Header".to_string(), "test-value".to_string());
 
         let config = OpenTelemetryConfig {
@@ -546,21 +545,24 @@ mod tests {
         let headers = validated_headers.unwrap();
         assert_eq!(headers.len(), 1);
 
-        let custom_header = http::HeaderName::from_static("x-custom-header");
+        let custom_header =
+            OrderedHeaderName::new(headers::HeaderName::from_static("x-custom-header"));
         assert!(headers.contains_key(&custom_header));
     }
 
     #[tokio::test]
     async fn test_header_case_normalization() {
-        let mut headers = IndexMap::new();
+        let mut headers = BTreeMap::new();
         headers.insert("X-Custom-Header".to_string(), "test-value".to_string());
         headers.insert("ANOTHER-HEADER".to_string(), "another-value".to_string());
 
         let validated_headers = validate_opentelemetry_headers(&headers, false).unwrap();
 
         // Header names should be normalized to lowercase
-        let custom_header = http::HeaderName::from_static("x-custom-header");
-        let another_header = http::HeaderName::from_static("another-header");
+        let custom_header =
+            OrderedHeaderName::new(headers::HeaderName::from_static("x-custom-header"));
+        let another_header =
+            OrderedHeaderName::new(headers::HeaderName::from_static("another-header"));
 
         assert!(validated_headers.contains_key(&custom_header));
         assert!(validated_headers.contains_key(&another_header));

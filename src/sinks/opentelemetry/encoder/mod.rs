@@ -12,7 +12,7 @@ use prost::Message;
 use vector_lib::opentelemetry::{
     logs::{
         ATTRIBUTES_KEY, DROPPED_ATTRIBUTES_COUNT_KEY, FLAGS_KEY, OBSERVED_TIMESTAMP_KEY,
-        SEVERITY_NUMBER_KEY, SEVERITY_TEXT_KEY, SPAN_ID_KEY, TRACE_ID_KEY,
+        RESOURCE_KEY, SEVERITY_NUMBER_KEY, SEVERITY_TEXT_KEY, SPAN_ID_KEY, TRACE_ID_KEY,
     },
     proto::{
         collector::{
@@ -90,7 +90,8 @@ impl OtlpEncoder {
                 let mut log = e.into_log();
 
                 // Extract resources before converting to log record
-                let resource_attrs = if let Some(resources) = log.remove(event_path!("resources")) {
+                let resource_attrs = if let Some(resources) = log.remove(event_path!(RESOURCE_KEY))
+                {
                     if let Value::Object(map) = resources {
                         convert_object_map_to_key_value_vec(map)
                     } else {

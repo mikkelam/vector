@@ -1,16 +1,17 @@
 //! Service implementation for the `opentelemetry` sink.
 
+use crate::sinks::util::http::OrderedHeaderName;
 use bytes::Bytes;
-use http::{header::CONTENT_TYPE, HeaderName, HeaderValue, Method, Request, Uri};
-use indexmap::IndexMap;
+use http::{HeaderValue, Method, Request, Uri, header::CONTENT_TYPE};
+use std::collections::BTreeMap;
 
 use crate::{
     http::Auth,
     sinks::{
         prelude::*,
         util::{
-            http::{HttpRequest, HttpServiceRequestBuilder},
             Compression,
+            http::{HttpRequest, HttpServiceRequestBuilder},
         },
     },
 };
@@ -27,7 +28,7 @@ pub(super) struct OtlpServiceRequestBuilder {
     pub(super) method: HttpMethod,
     pub(super) compression: Compression,
     pub(super) encoding: ContentEncoding,
-    pub(super) headers: IndexMap<HeaderName, HeaderValue>,
+    pub(super) headers: BTreeMap<OrderedHeaderName, HeaderValue>,
 }
 
 impl HttpServiceRequestBuilder<PartitionKey> for OtlpServiceRequestBuilder {
@@ -70,10 +71,11 @@ impl HttpServiceRequestBuilder<PartitionKey> for OtlpServiceRequestBuilder {
             .map_err(|err| crate::Error::from(format!("Failed to build HTTP request: {}", err)))?;
 
         // Apply custom headers from request config
-        for (name, value) in &self.headers {
-            http_request
-                .headers_mut()
-                .insert(name.clone(), value.clone());
+        {
+            let headers = http_request.headers_mut();
+            for (header_name, header_value) in self.headers.iter() {
+                headers.insert(header_name.inner(), header_value.clone());
+            }
         }
 
         if let Some(auth) = &self.auth {
