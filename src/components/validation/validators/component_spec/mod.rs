@@ -1,5 +1,5 @@
 use crate::components::validation::{
-    component_names::*, ComponentType, RunnerMetrics, TestCaseExpectation, TestEvent,
+    ComponentType, RunnerMetrics, TestCaseExpectation, TestEvent, component_names::*,
 };
 use vector_lib::event::{Event, Metric, MetricKind};
 
@@ -129,11 +129,7 @@ fn validate_telemetry(
         }
     });
 
-    if errs.is_empty() {
-        Ok(out)
-    } else {
-        Err(errs)
-    }
+    if errs.is_empty() { Ok(out) } else { Err(errs) }
 }
 
 fn validate_metric(
@@ -256,7 +252,7 @@ fn sum_counters(
                     sum += *value;
                 }
             }
-            _ => errs.push(format!("{}: metric value is not a counter", metric_name,)),
+            _ => errs.push(format!("{metric_name}: metric value is not a counter",)),
         }
     }
 

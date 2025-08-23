@@ -1,7 +1,7 @@
 use std::{
     mem,
     pin::Pin,
-    task::{ready, Context, Poll},
+    task::{Context, Poll, ready},
 };
 
 use async_recursion::async_recursion;
@@ -12,12 +12,13 @@ use vector_common::internal_event::emit;
 
 use super::limited_queue::LimitedReceiver;
 use crate::{
+    Bufferable,
     buffer_usage_data::BufferUsageHandle,
     variants::disk_v2::{self, ProductionFilesystem},
-    Bufferable,
 };
 
 /// Adapter for papering over various receiver backends.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug)]
 pub enum ReceiverAdapter<T: Bufferable> {
     /// The in-memory channel buffer.
@@ -156,6 +157,7 @@ impl<T: Bufferable> BufferReceiver<T> {
     }
 }
 
+#[allow(clippy::large_enum_variant)]
 enum StreamState<T: Bufferable> {
     Idle(BufferReceiver<T>),
     Polling,

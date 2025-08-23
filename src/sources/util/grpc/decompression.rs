@@ -11,12 +11,12 @@ use flate2::write::GzDecoder;
 use futures_util::FutureExt;
 use http::{Request, Response};
 use hyper::{
-    body::{HttpBody, Sender},
     Body,
+    body::{HttpBody, Sender},
 };
 use std::future::Future;
 use tokio::{pin, select};
-use tonic::{body::BoxBody, metadata::AsciiMetadataValue, Status};
+use tonic::{Status, body::BoxBody, metadata::AsciiMetadataValue};
 use tower::{Layer, Service};
 use vector_lib::internal_event::{
     ByteSize, BytesReceived, InternalEventHandle as _, Protocol, Registered,
@@ -42,8 +42,7 @@ impl CompressionScheme {
             .map(|s| {
                 s.to_str().map(|s| s.to_string()).map_err(|_| {
                     Status::unimplemented(format!(
-                        "`{}` contains non-visible characters and is not a valid encoding",
-                        GRPC_ENCODING_HEADER
+                        "`{GRPC_ENCODING_HEADER}` contains non-visible characters and is not a valid encoding"
                     ))
                 })
             })
@@ -53,8 +52,7 @@ impl CompressionScheme {
                 Some(scheme) => match scheme.as_str() {
                     "gzip" => Ok(Some(CompressionScheme::Gzip)),
                     other => Err(Status::unimplemented(format!(
-                        "compression scheme `{}` is not supported",
-                        other
+                        "compression scheme `{other}` is not supported"
                     ))),
                 },
             })

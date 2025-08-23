@@ -6,7 +6,7 @@ use crate::event::{ObjectMap, Value};
 use crate::sinks::VectorSink;
 use crate::template::Template;
 use crate::test_util::{
-    components::{assert_sink_compliance, SINK_TAGS},
+    components::{SINK_TAGS, assert_sink_compliance},
     random_lines_with_stream, random_string, trace_init,
 };
 use crate::tls::TEST_PEM_INTERMEDIATE_CA_PATH;
@@ -75,7 +75,7 @@ async fn pulsar_happy_reuse(mut cnf: PulsarSinkConfig) {
     for line in input {
         let msg = match consumer.next().await.unwrap() {
             Ok(msg) => msg,
-            Err(error) => panic!("{:?}", error),
+            Err(error) => panic!("{error:?}"),
         };
         consumer.ack(&msg).await.unwrap();
         assert_eq!(String::from_utf8_lossy(&msg.payload.data), line);

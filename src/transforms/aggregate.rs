@@ -1,5 +1,5 @@
 use std::{
-    collections::{hash_map::Entry, HashMap},
+    collections::{HashMap, hash_map::Entry},
     pin::Pin,
     time::Duration,
 };
@@ -370,8 +370,8 @@ mod tests {
     use crate::schema::Definition;
     use crate::{
         event::{
-            metric::{MetricKind, MetricValue},
             Event, Metric,
+            metric::{MetricKind, MetricValue},
         },
         test_util::components::assert_transform_compliance,
         transforms::test::create_topology,
@@ -1117,15 +1117,18 @@ interval_ms = 999999
             // available.
             let mut count = 0_u8;
             while count < 2 {
-                if let Some(event) = out.next().await {
-                    match event.as_metric().series().name.name.as_str() {
-                        "counter_a" => assert_eq!(counter_a_summed, event),
-                        "gauge_a" => assert_eq!(gauge_a_2, event),
-                        _ => panic!("Unexpected metric name in aggregate output"),
-                    };
-                    count += 1;
-                } else {
-                    panic!("Unexpectedly received None in output stream");
+                match out.next().await {
+                    Some(event) => {
+                        match event.as_metric().series().name.name.as_str() {
+                            "counter_a" => assert_eq!(counter_a_summed, event),
+                            "gauge_a" => assert_eq!(gauge_a_2, event),
+                            _ => panic!("Unexpected metric name in aggregate output"),
+                        };
+                        count += 1;
+                    }
+                    _ => {
+                        panic!("Unexpectedly received None in output stream");
+                    }
                 }
             }
             // We should be back to pending, having nothing waiting for us

@@ -4,20 +4,20 @@ use std::{collections::HashSet, error, fmt, future::ready, pin::Pin};
 use arc_swap::ArcSwap;
 use bytes::Bytes;
 use futures::{Stream, StreamExt};
-use http::{uri::PathAndQuery, Request, StatusCode, Uri};
-use hyper::{body::to_bytes as body_to_bytes, Body};
+use http::{Request, StatusCode, Uri, uri::PathAndQuery};
+use hyper::{Body, body::to_bytes as body_to_bytes};
 use serde::Deserialize;
 use serde_with::serde_as;
 use snafu::ResultExt as _;
-use tokio::time::{sleep, Duration, Instant};
+use tokio::time::{Duration, Instant, sleep};
 use tracing::Instrument;
 use vector_lib::config::LogNamespace;
 use vector_lib::configurable::configurable_component;
+use vector_lib::lookup::OwnedTargetPath;
 use vector_lib::lookup::lookup_v2::{OptionalTargetPath, OwnedSegment};
 use vector_lib::lookup::owned_value_path;
-use vector_lib::lookup::OwnedTargetPath;
-use vrl::value::kind::Collection;
 use vrl::value::Kind;
+use vrl::value::kind::Collection;
 
 use crate::config::OutputId;
 use crate::{
@@ -509,10 +509,8 @@ impl MetadataClient {
                     let mac = String::from_utf8_lossy(&mac[..]);
 
                     if self.fields.contains(SUBNET_ID_KEY) {
-                        let subnet_path = format!(
-                            "/latest/meta-data/network/interfaces/macs/{}/subnet-id",
-                            mac
-                        );
+                        let subnet_path =
+                            format!("/latest/meta-data/network/interfaces/macs/{mac}/subnet-id");
 
                         let subnet_path = subnet_path.parse().context(ParsePathSnafu {
                             value: subnet_path.clone(),
@@ -525,7 +523,7 @@ impl MetadataClient {
 
                     if self.fields.contains(VPC_ID_KEY) {
                         let vpc_path =
-                            format!("/latest/meta-data/network/interfaces/macs/{}/vpc-id", mac);
+                            format!("/latest/meta-data/network/interfaces/macs/{mac}/vpc-id");
 
                         let vpc_path = vpc_path.parse().context(ParsePathSnafu {
                             value: vpc_path.clone(),
@@ -562,7 +560,7 @@ impl MetadataClient {
             }
 
             for tag in self.tags.clone() {
-                let tag_path = format!("/latest/meta-data/tags/instance/{}", tag);
+                let tag_path = format!("/latest/meta-data/tags/instance/{tag}");
 
                 let tag_path = tag_path.parse().context(ParsePathSnafu {
                     value: tag_path.clone(),
@@ -746,11 +744,11 @@ mod integration_tests {
     use tokio::sync::mpsc;
     use tokio_stream::wrappers::ReceiverStream;
     use vector_lib::lookup::lookup_v2::{OwnedSegment, OwnedValuePath};
-    use vector_lib::lookup::{event_path, PathPrefix};
+    use vector_lib::lookup::{PathPrefix, event_path};
 
     use super::*;
     use crate::{
-        event::{metric, LogEvent, Metric},
+        event::{LogEvent, Metric, metric},
         test_util::{components::assert_transform_compliance, next_addr},
         transforms::test::create_topology,
     };
@@ -906,7 +904,7 @@ mod integration_tests {
         let _server = tokio::spawn(server);
 
         let config = Ec2Metadata {
-            endpoint: format!("http://{}", addr),
+            endpoint: format!("http://{addr}"),
             refresh_timeout_secs: Duration::from_secs(1),
             ..Default::default()
         };
@@ -937,7 +935,7 @@ mod integration_tests {
         let _server = tokio::spawn(server);
 
         let config = Ec2Metadata {
-            endpoint: format!("http://{}", addr),
+            endpoint: format!("http://{addr}"),
             refresh_timeout_secs: Duration::from_secs(1),
             required: false,
             ..Default::default()
@@ -1016,10 +1014,10 @@ mod integration_tests {
 
             let log = LogEvent::default();
             let mut expected_log = log.clone();
-            expected_log.insert(format!("\"{}\"", PUBLIC_IPV4_KEY).as_str(), "192.0.2.54");
-            expected_log.insert(format!("\"{}\"", REGION_KEY).as_str(), "us-east-1");
+            expected_log.insert(format!("\"{PUBLIC_IPV4_KEY}\"").as_str(), "192.0.2.54");
+            expected_log.insert(format!("\"{REGION_KEY}\"").as_str(), "us-east-1");
             expected_log.insert(
-                format!("\"{}\"", TAGS_KEY).as_str(),
+                format!("\"{TAGS_KEY}\"").as_str(),
                 ObjectMap::from([
                     ("Name".into(), Value::from("test-instance")),
                     ("Test".into(), Value::from("test-tag")),

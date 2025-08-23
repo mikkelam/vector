@@ -1,8 +1,8 @@
 use std::sync::Arc;
 
-use futures::{stream, Sink, Stream};
-use futures_util::{future, stream::BoxStream, FutureExt, StreamExt};
-use tokio::sync::{oneshot, Mutex};
+use futures::{Sink, Stream, stream};
+use futures_util::{FutureExt, StreamExt, future, stream::BoxStream};
+use tokio::sync::{Mutex, oneshot};
 use vector_lib::configurable::configurable_component;
 use vector_lib::{
     config::{DataType, Input, LogNamespace},
@@ -220,8 +220,7 @@ impl StreamSink<Event> for UnitTestSink {
                                         break;
                                     }
                                     Err(error) => {
-                                        condition_errors
-                                            .push(format!("  condition[{}]: {}", j, error));
+                                        condition_errors.push(format!("  condition[{j}]: {error}"));
                                     }
                                 }
                             }

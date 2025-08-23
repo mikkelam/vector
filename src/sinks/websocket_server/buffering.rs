@@ -3,12 +3,12 @@ use std::{collections::VecDeque, net::SocketAddr, num::NonZeroUsize};
 
 use bytes::Bytes;
 use derivative::Derivative;
-use tokio_tungstenite::tungstenite::{handshake::server::Request, Message};
+use tokio_tungstenite::tungstenite::{Message, handshake::server::Request};
 use url::Url;
 use uuid::Uuid;
 use vector_config::configurable_component;
 use vector_lib::{
-    codecs::decoding::{format::Deserializer as _, DeserializerConfig},
+    codecs::decoding::{DeserializerConfig, format::Deserializer as _},
     event::{Event, MaybeAsLogMut},
     lookup::lookup_v2::ConfigValuePath,
 };
@@ -212,7 +212,7 @@ impl WsMessageBufferConfig for Option<MessageBufferingConfig> {
                 {
                     match Uuid::parse_str(&last_received_param_value) {
                         Ok(last_received_val) => {
-                            return BufferReplayRequest::with_replay_from(last_received_val)
+                            return BufferReplayRequest::with_replay_from(last_received_val);
                         }
                         Err(err) => {
                             warn!(message = "Parsing last received message UUID failed.", %err)
@@ -233,7 +233,7 @@ impl WsMessageBufferConfig for Option<MessageBufferingConfig> {
     fn add_replay_message_id_to_event(&self, event: &mut Event) -> Uuid {
         let message_id = Uuid::now_v7();
         if let Some(MessageBufferingConfig {
-            message_id_path: Some(ref message_id_path),
+            message_id_path: Some(message_id_path),
             ..
         }) = self
         {

@@ -7,7 +7,7 @@ use anyhow::Result;
 use super::config::{Environment, IntegrationRunnerConfig, RustToolchainConfig};
 use crate::app::{self, CommandExt as _};
 use crate::testing::build::prepare_build_command;
-use crate::testing::docker::{docker_command, DOCKER_SOCKET};
+use crate::testing::docker::{DOCKER_SOCKET, docker_command};
 use crate::util::{ChainArgs as _, IS_A_TTY};
 
 const MOUNT_PATH: &str = "/home/vector";
@@ -169,10 +169,11 @@ pub trait ContainerTestRunner: TestRunner {
         let network_name = self.network_name().unwrap_or("host");
 
         let docker_socket = format!("{}:/var/run/docker.sock", DOCKER_SOCKET.display());
-        let docker_args = self
-            .needs_docker_socket()
-            .then(|| vec!["--volume", &docker_socket])
-            .unwrap_or_default();
+        let docker_args = if self.needs_docker_socket() {
+            vec!["--volume", &docker_socket]
+        } else {
+            vec![]
+        };
 
         let volumes = self.volumes();
         let volumes: Vec<_> = volumes
@@ -251,6 +252,7 @@ where
     }
 }
 
+#[derive(Debug)]
 pub(super) struct IntegrationTestRunner {
     // The integration is None when compiling the runner image with the `all-integration-tests` feature.
     integration: Option<String>,
