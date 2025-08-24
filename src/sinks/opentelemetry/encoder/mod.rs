@@ -10,10 +10,7 @@ use hex;
 
 use prost::Message;
 use vector_lib::opentelemetry::{
-    logs::{
-        ATTRIBUTES_KEY, DROPPED_ATTRIBUTES_COUNT_KEY, FLAGS_KEY, OBSERVED_TIMESTAMP_KEY,
-        RESOURCE_KEY, SEVERITY_NUMBER_KEY, SEVERITY_TEXT_KEY, SPAN_ID_KEY, TRACE_ID_KEY,
-    },
+    logs as otlp_logs,
     proto::{
         collector::{
             logs::v1::ExportLogsServiceRequest, metrics::v1::ExportMetricsServiceRequest,
@@ -220,15 +217,16 @@ trait ResourceAttributeExtractor {
 impl ResourceAttributeExtractor for LogEvent {
     fn extract_resource_attributes(&mut self) -> Vec<KeyValue> {
         // Extract resource attributes from nested "resources" object
-        let resource_attrs = if let Some(resources) = self.remove(event_path!(RESOURCE_KEY)) {
-            if let Value::Object(map) = resources {
-                convert_object_map_to_key_value_vec(map)
+        let resource_attrs =
+            if let Some(resources) = self.remove(event_path!(otlp_logs::RESOURCE_KEY)) {
+                if let Value::Object(map) = resources {
+                    convert_object_map_to_key_value_vec(map)
+                } else {
+                    Vec::new()
+                }
             } else {
                 Vec::new()
-            }
-        } else {
-            Vec::new()
-        };
+            };
 
         resource_attrs
     }
@@ -259,15 +257,16 @@ impl ResourceAttributeExtractor for VectorMetric {
 impl ResourceAttributeExtractor for TraceEvent {
     fn extract_resource_attributes(&mut self) -> Vec<KeyValue> {
         // Extract resource attributes from nested "resources" object
-        let resource_attrs = if let Some(resources) = self.remove(event_path!(RESOURCE_KEY)) {
-            if let Value::Object(map) = resources {
-                convert_object_map_to_key_value_vec(map)
+        let resource_attrs =
+            if let Some(resources) = self.remove(event_path!(otlp_logs::RESOURCE_KEY)) {
+                if let Value::Object(map) = resources {
+                    convert_object_map_to_key_value_vec(map)
+                } else {
+                    Vec::new()
+                }
             } else {
                 Vec::new()
-            }
-        } else {
-            Vec::new()
-        };
+            };
 
         resource_attrs
     }
@@ -639,7 +638,7 @@ fn convert_sketch_to_otlp(
 }
 
 /// Converts a single Vector `LogEvent` into an OTLP `LogRecord`.
-fn convert_log_event_to_log_record(&self, mut log: LogEvent) -> LogRecord {
+fn convert_log_event_to_log_record(mut log: LogEvent) -> LogRecord {
     let mut log_record = LogRecord::default();
 
     // Handle body/message
@@ -653,71 +652,57 @@ fn convert_log_event_to_log_record(&self, mut log: LogEvent) -> LogRecord {
     }
 
     // Handle observed timestamp
-    if let Some(Value::Timestamp(timestamp)) = log.remove(event_path!(OBSERVED_TIMESTAMP_KEY)) {
+    if let Some(Value::Timestamp(timestamp)) =
+        log.remove(event_path!(otlp_logs::OBSERVED_TIMESTAMP_KEY))
+    {
         log_record.observed_time_unix_nano = timestamp.timestamp_nanos_opt().unwrap_or(0) as u64;
     }
 
-    // Handle trace_id
-    if let Some(trace_id) = log.remove(event_path!(TRACE_ID_KEY)) {
-        match trace_id {
-            Value::Bytes(bytes) => {
-                if bytes.len() == 16 {
-                    log_record.trace_id = bytes.into();
-                } else if let Ok(decoded) = hex::decode(bytes.as_ref()) {
-                    if decoded.len() == 16 {
-                        log_record.trace_id = decoded;
-                    }
-                }
-            }
-            _ => {}
+    // Handle trace_id (bytes or hex string)
+    if let Some(value) = log.remove(event_path!(otlp_logs::TRACE_ID_KEY)) {
+        let id = decode_otlp_id_from_value(&value, 16);
+        if !id.is_empty() {
+            log_record.trace_id = id;
         }
     }
 
-    // Handle span_id
-    if let Some(span_id) = log.remove(event_path!(SPAN_ID_KEY)) {
-        match span_id {
-            Value::Bytes(bytes) => {
-                if bytes.len() == 8 {
-                    log_record.span_id = bytes.into();
-                } else if let Ok(decoded) = hex::decode(bytes.as_ref()) {
-                    if decoded.len() == 8 {
-                        log_record.span_id = decoded;
-                    }
-                }
-            }
-            _ => {}
+    // Handle span_id (bytes or hex string)
+    if let Some(value) = log.remove(event_path!(otlp_logs::SPAN_ID_KEY)) {
+        let id = decode_otlp_id_from_value(&value, 8);
+        if !id.is_empty() {
+            log_record.span_id = id;
         }
     }
 
     // Handle severity
-    if let Some(severity_text) = log.remove(event_path!(SEVERITY_TEXT_KEY)) {
+    if let Some(severity_text) = log.remove(event_path!(otlp_logs::SEVERITY_TEXT_KEY)) {
         if let Value::Bytes(text) = severity_text {
             log_record.severity_text = String::from_utf8_lossy(&text).to_string();
         }
     }
 
-    if let Some(severity_number) = log.remove(event_path!(SEVERITY_NUMBER_KEY)) {
+    if let Some(severity_number) = log.remove(event_path!(otlp_logs::SEVERITY_NUMBER_KEY)) {
         if let Value::Integer(num) = severity_number {
             log_record.severity_number = num as i32;
         }
     }
 
     // Handle flags
-    if let Some(flags) = log.remove(event_path!(FLAGS_KEY)) {
+    if let Some(flags) = log.remove(event_path!(otlp_logs::FLAGS_KEY)) {
         if let Value::Integer(f) = flags {
             log_record.flags = f as u32;
         }
     }
 
     // Handle dropped_attributes_count
-    if let Some(count) = log.remove(event_path!(DROPPED_ATTRIBUTES_COUNT_KEY)) {
+    if let Some(count) = log.remove(event_path!(otlp_logs::DROPPED_ATTRIBUTES_COUNT_KEY)) {
         if let Value::Integer(c) = count {
             log_record.dropped_attributes_count = c as u32;
         }
     }
 
     // Handle attributes
-    if let Some(attrs) = log.remove(event_path!(ATTRIBUTES_KEY)) {
+    if let Some(attrs) = log.remove(event_path!(otlp_logs::ATTRIBUTES_KEY)) {
         match attrs {
             Value::Object(map) => {
                 log_record
@@ -749,20 +734,17 @@ fn convert_vector_trace_to_otlp_span(trace: TraceEvent) -> Span {
     // Extract required fields with fallbacks
     let trace_id = trace_map
         .get("trace_id")
-        .and_then(|v| v.as_str())
-        .map(|s| hex_string_to_bytes(s.as_ref()))
+        .map(|v| decode_otlp_id_from_value(v, 16))
         .unwrap_or_default();
 
     let span_id = trace_map
         .get("span_id")
-        .and_then(|v| v.as_str())
-        .map(|s| hex_string_to_bytes(s.as_ref()))
+        .map(|v| decode_otlp_id_from_value(v, 8))
         .unwrap_or_default();
 
     let parent_span_id = trace_map
         .get("parent_span_id")
-        .and_then(|v| v.as_str())
-        .map(|s| hex_string_to_bytes(s.as_ref()))
+        .map(|v| decode_otlp_id_from_value(v, 8))
         .unwrap_or_default();
 
     let name = trace_map
@@ -792,24 +774,15 @@ fn convert_vector_trace_to_otlp_span(trace: TraceEvent) -> Span {
         .unwrap_or_default();
 
     // Handle timestamps - either direct fields or calculated from timestamp/duration
-    let end_time_unix_nano = if let Some(end_time) =
-        trace_map.get("end_time_unix_nano").and_then(|v| {
-            if let Some(ts) = v.as_timestamp() {
-                ts.timestamp_nanos_opt()
-            } else {
-                v.as_integer()
-            }
-        }) {
-        end_time as u64
-    } else if let Some(timestamp) = trace_map
-        .get("timestamp")
-        .and_then(|v| v.as_timestamp())
-        .and_then(|ts| ts.timestamp_nanos_opt())
-    {
-        timestamp as u64
-    } else {
-        0
-    };
+    let end_time_unix_nano = trace_map
+        .get("end_time_unix_nano")
+        .and_then(|v| to_nanos_from_value(v))
+        .or_else(|| {
+            trace_map
+                .get("timestamp")
+                .and_then(|v| to_nanos_from_value(v))
+        })
+        .unwrap_or(0);
 
     let start_time_unix_nano = if let Some(start_time) =
         trace_map.get("start_time_unix_nano").and_then(|v| {
@@ -924,22 +897,54 @@ fn convert_vector_trace_to_otlp_span(trace: TraceEvent) -> Span {
     }
 }
 
-fn hex_string_to_bytes(hex_str: &str) -> Vec<u8> {
-    hex::decode(hex_str).unwrap_or_default()
+fn decode_otlp_id_from_value(value: &Value, expected_len: usize) -> Vec<u8> {
+    match value {
+        // If it's bytes of the correct length, accept directly
+        Value::Bytes(bytes) => {
+            if bytes.len() == expected_len {
+                bytes.as_ref().to_vec()
+            } else {
+                // Try interpreting the bytes as UTF-8 hex string
+                match std::str::from_utf8(bytes.as_ref()) {
+                    Ok(s) => hex::decode(s)
+                        .ok()
+                        .filter(|v| v.len() == expected_len)
+                        .unwrap_or_default(),
+                    Err(_) => Vec::new(),
+                }
+            }
+        }
+        // If it's a string, decode as hex
+        v if v.as_str().is_some() => {
+            let s = v.as_str().unwrap();
+            hex::decode(s.as_bytes())
+                .ok()
+                .filter(|v| v.len() == expected_len)
+                .unwrap_or_default()
+        }
+        _ => Vec::new(),
+    }
+}
+
+fn to_nanos_from_value(value: &Value) -> Option<u64> {
+    if let Some(ts) = value.as_timestamp() {
+        ts.timestamp_nanos_opt().map(|n| n as u64)
+    } else {
+        value.as_integer().map(|n| n as u64)
+    }
 }
 
 fn convert_value_to_span_event(value: &Value) -> Option<SpanEvent> {
     let obj = value.as_object()?;
 
     let name = obj.get("name")?.as_str()?.to_string();
-    let time_unix_nano =
-        if let Some(timestamp) = obj.get("timestamp").and_then(|v| v.as_timestamp()) {
-            timestamp.timestamp_nanos_opt().unwrap_or(0) as u64
-        } else if let Some(time_nano) = obj.get("time_unix_nano").and_then(|v| v.as_integer()) {
-            time_nano as u64
-        } else {
-            0
-        };
+    let time_unix_nano = if let Some(v) = obj.get("time_unix_nano") {
+        to_nanos_from_value(v).unwrap_or(0)
+    } else if let Some(v) = obj.get("timestamp") {
+        to_nanos_from_value(v).unwrap_or(0)
+    } else {
+        0
+    };
 
     let attributes = obj
         .get("attributes")
@@ -963,15 +968,15 @@ fn convert_value_to_span_event(value: &Value) -> Option<SpanEvent> {
 fn convert_value_to_span_link(value: &Value) -> Option<Link> {
     let obj = value.as_object()?;
 
-    let trace_id = obj
-        .get("trace_id")?
-        .as_str()
-        .map(|s| hex_string_to_bytes(s.as_ref()))?;
+    let trace_id = obj.get("trace_id").and_then(|v| {
+        let id = decode_otlp_id_from_value(v, 16);
+        if id.is_empty() { None } else { Some(id) }
+    })?;
 
-    let span_id = obj
-        .get("span_id")?
-        .as_str()
-        .map(|s| hex_string_to_bytes(s.as_ref()))?;
+    let span_id = obj.get("span_id").and_then(|v| {
+        let id = decode_otlp_id_from_value(v, 8);
+        if id.is_empty() { None } else { Some(id) }
+    })?;
 
     let trace_state = obj
         .get("trace_state")
@@ -997,6 +1002,13 @@ fn convert_value_to_span_link(value: &Value) -> Option<Link> {
         attributes,
         dropped_attributes_count,
     })
+}
+
+impl OtlpEncoder {
+    #[cfg(test)]
+    pub(super) fn convert_log_event_to_log_record(&self, log: LogEvent) -> LogRecord {
+        convert_log_event_to_log_record(log)
+    }
 }
 
 #[cfg(test)]
