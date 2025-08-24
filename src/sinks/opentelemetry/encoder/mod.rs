@@ -84,7 +84,7 @@ impl OtlpEncoder {
                         dropped_attributes_count: 0,
                     }),
                     scope_logs: vec![
-                        self.create_scope_logs(vec![self.convert_log_event_to_log_record(log)]),
+                        self.create_scope_logs(vec![convert_log_event_to_log_record(log)]),
                     ],
                     schema_url: String::new(),
                 }
@@ -96,119 +96,13 @@ impl OtlpEncoder {
         Ok(request.encode_to_vec().into())
     }
 
-    /// Converts a single Vector `LogEvent` into an OTLP `LogRecord`.
-    fn convert_log_event_to_log_record(&self, mut log: LogEvent) -> LogRecord {
-        let mut log_record = LogRecord::default();
-
-        // Handle body/message
-        if let Some(msg) = log.get_message() {
-            log_record.body = Some(convert_value_to_any_value(msg.clone()));
-        }
-
-        // Handle timestamp
-        if let Some(Value::Timestamp(timestamp)) = log.get_timestamp() {
-            log_record.time_unix_nano = timestamp.timestamp_nanos_opt().unwrap_or(0) as u64;
-        }
-
-        // Handle observed timestamp
-        if let Some(Value::Timestamp(timestamp)) = log.remove(event_path!(OBSERVED_TIMESTAMP_KEY)) {
-            log_record.observed_time_unix_nano =
-                timestamp.timestamp_nanos_opt().unwrap_or(0) as u64;
-        }
-
-        // Handle trace_id
-        if let Some(trace_id) = log.remove(event_path!(TRACE_ID_KEY)) {
-            match trace_id {
-                Value::Bytes(bytes) => {
-                    if bytes.len() == 16 {
-                        log_record.trace_id = bytes.into();
-                    } else if let Ok(decoded) = hex::decode(bytes.as_ref()) {
-                        if decoded.len() == 16 {
-                            log_record.trace_id = decoded;
-                        }
-                    }
-                }
-                _ => {}
-            }
-        }
-
-        // Handle span_id
-        if let Some(span_id) = log.remove(event_path!(SPAN_ID_KEY)) {
-            match span_id {
-                Value::Bytes(bytes) => {
-                    if bytes.len() == 8 {
-                        log_record.span_id = bytes.into();
-                    } else if let Ok(decoded) = hex::decode(bytes.as_ref()) {
-                        if decoded.len() == 8 {
-                            log_record.span_id = decoded;
-                        }
-                    }
-                }
-                _ => {}
-            }
-        }
-
-        // Handle severity
-        if let Some(severity_text) = log.remove(event_path!(SEVERITY_TEXT_KEY)) {
-            if let Value::Bytes(text) = severity_text {
-                log_record.severity_text = String::from_utf8_lossy(&text).to_string();
-            }
-        }
-
-        if let Some(severity_number) = log.remove(event_path!(SEVERITY_NUMBER_KEY)) {
-            if let Value::Integer(num) = severity_number {
-                log_record.severity_number = num as i32;
-            }
-        }
-
-        // Handle flags
-        if let Some(flags) = log.remove(event_path!(FLAGS_KEY)) {
-            if let Value::Integer(f) = flags {
-                log_record.flags = f as u32;
-            }
-        }
-
-        // Handle dropped_attributes_count
-        if let Some(count) = log.remove(event_path!(DROPPED_ATTRIBUTES_COUNT_KEY)) {
-            if let Value::Integer(c) = count {
-                log_record.dropped_attributes_count = c as u32;
-            }
-        }
-
-        // Handle attributes
-        if let Some(attrs) = log.remove(event_path!(ATTRIBUTES_KEY)) {
-            match attrs {
-                Value::Object(map) => {
-                    log_record
-                        .attributes
-                        .extend(convert_object_map_to_key_value_vec(map));
-                }
-                _ => {}
-            }
-        }
-
-        // Remove core Vector fields that shouldn't be attributes
-        log.remove(event_path!("message"));
-        log.remove(event_path!("timestamp"));
-        log.remove(event_path!("source_type"));
-
-        // Convert remaining fields to attributes
-        if let Some(map) = log.as_map() {
-            log_record
-                .attributes
-                .extend(convert_object_map_to_key_value_vec(map.clone()));
-        }
-
-        log_record
-    }
-
     /// Encodes a batch of metric events into an `ExportMetricsServiceRequest` Protobuf message.
     pub(super) fn encode_metrics(&self, events: Vec<Event>) -> Result<Bytes, ()> {
         let resource_metrics = events
             .into_iter()
             .filter_map(|e| {
                 let mut metric = e.into_metric();
-                let resource_attrs = metric.extract_all_resource_attributes();
+                let resource_attrs = metric.extract_resource_attributes();
 
                 // Apply normalization to convert incremental metrics to absolute
                 let mut normalizer = OtlpMetricNormalize;
@@ -239,7 +133,7 @@ impl OtlpEncoder {
             .into_iter()
             .map(|e| {
                 let mut trace = e.into_trace();
-                let resource_attrs = trace.extract_all_resource_attributes();
+                let resource_attrs = trace.extract_resource_attributes();
 
                 ResourceSpans {
                     resource: Some(Resource {
@@ -321,24 +215,6 @@ impl crate::sinks::util::encoding::Encoder<Vec<Event>> for OtlpEncoder {
 /// Trait for extracting and removing resource attributes from events
 trait ResourceAttributeExtractor {
     fn extract_resource_attributes(&mut self) -> Vec<KeyValue>;
-
-    /// Extract nested resource attributes (default: empty, override for logs/traces)
-    fn extract_nested_resource_attributes(&mut self) -> Vec<KeyValue> {
-        Vec::new()
-    }
-
-    /// Extract all resource attributes (both nested and flattened formats)
-    fn extract_all_resource_attributes(&mut self) -> Vec<KeyValue> {
-        let mut resource_attributes = Vec::new();
-
-        // Try nested format first (if supported by event type)
-        resource_attributes.extend(self.extract_nested_resource_attributes());
-
-        // Then extract flattened fields for Vector OTLP source compatibility
-        resource_attributes.extend(self.extract_resource_attributes());
-
-        resource_attributes
-    }
 }
 
 impl ResourceAttributeExtractor for LogEvent {
@@ -760,6 +636,111 @@ fn convert_sketch_to_otlp(
             }))
         }
     }
+}
+
+/// Converts a single Vector `LogEvent` into an OTLP `LogRecord`.
+fn convert_log_event_to_log_record(&self, mut log: LogEvent) -> LogRecord {
+    let mut log_record = LogRecord::default();
+
+    // Handle body/message
+    if let Some(msg) = log.get_message() {
+        log_record.body = Some(convert_value_to_any_value(msg.clone()));
+    }
+
+    // Handle timestamp
+    if let Some(Value::Timestamp(timestamp)) = log.get_timestamp() {
+        log_record.time_unix_nano = timestamp.timestamp_nanos_opt().unwrap_or(0) as u64;
+    }
+
+    // Handle observed timestamp
+    if let Some(Value::Timestamp(timestamp)) = log.remove(event_path!(OBSERVED_TIMESTAMP_KEY)) {
+        log_record.observed_time_unix_nano = timestamp.timestamp_nanos_opt().unwrap_or(0) as u64;
+    }
+
+    // Handle trace_id
+    if let Some(trace_id) = log.remove(event_path!(TRACE_ID_KEY)) {
+        match trace_id {
+            Value::Bytes(bytes) => {
+                if bytes.len() == 16 {
+                    log_record.trace_id = bytes.into();
+                } else if let Ok(decoded) = hex::decode(bytes.as_ref()) {
+                    if decoded.len() == 16 {
+                        log_record.trace_id = decoded;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    // Handle span_id
+    if let Some(span_id) = log.remove(event_path!(SPAN_ID_KEY)) {
+        match span_id {
+            Value::Bytes(bytes) => {
+                if bytes.len() == 8 {
+                    log_record.span_id = bytes.into();
+                } else if let Ok(decoded) = hex::decode(bytes.as_ref()) {
+                    if decoded.len() == 8 {
+                        log_record.span_id = decoded;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    // Handle severity
+    if let Some(severity_text) = log.remove(event_path!(SEVERITY_TEXT_KEY)) {
+        if let Value::Bytes(text) = severity_text {
+            log_record.severity_text = String::from_utf8_lossy(&text).to_string();
+        }
+    }
+
+    if let Some(severity_number) = log.remove(event_path!(SEVERITY_NUMBER_KEY)) {
+        if let Value::Integer(num) = severity_number {
+            log_record.severity_number = num as i32;
+        }
+    }
+
+    // Handle flags
+    if let Some(flags) = log.remove(event_path!(FLAGS_KEY)) {
+        if let Value::Integer(f) = flags {
+            log_record.flags = f as u32;
+        }
+    }
+
+    // Handle dropped_attributes_count
+    if let Some(count) = log.remove(event_path!(DROPPED_ATTRIBUTES_COUNT_KEY)) {
+        if let Value::Integer(c) = count {
+            log_record.dropped_attributes_count = c as u32;
+        }
+    }
+
+    // Handle attributes
+    if let Some(attrs) = log.remove(event_path!(ATTRIBUTES_KEY)) {
+        match attrs {
+            Value::Object(map) => {
+                log_record
+                    .attributes
+                    .extend(convert_object_map_to_key_value_vec(map));
+            }
+            _ => {}
+        }
+    }
+
+    // Remove core Vector fields that shouldn't be attributes
+    log.remove(event_path!("message"));
+    log.remove(event_path!("timestamp"));
+    log.remove(event_path!("source_type"));
+
+    // Convert remaining fields to attributes
+    if let Some(map) = log.as_map() {
+        log_record
+            .attributes
+            .extend(convert_object_map_to_key_value_vec(map.clone()));
+    }
+
+    log_record
 }
 
 fn convert_vector_trace_to_otlp_span(trace: TraceEvent) -> Span {
