@@ -1,6 +1,5 @@
 use crate::sinks::opentelemetry::encoder::OtlpEncoder;
-use crate::sinks::opentelemetry::encoder::PbValue;
-use crate::sinks::opentelemetry::encoder::ResourceAttributeExtractor;
+
 use crate::sinks::util::encoding::Encoder;
 use prost::Message;
 use std::collections::BTreeMap;
@@ -10,7 +9,6 @@ use vector_lib::opentelemetry::proto::collector::trace::v1::ExportTraceServiceRe
 use vector_lib::opentelemetry::proto::common::v1::any_value;
 use vector_lib::opentelemetry::proto::trace::v1::span::SpanKind;
 use vrl::core::Value;
-use vrl::value::ObjectMap;
 
 #[test]
 fn test_full_trace_conversion() {

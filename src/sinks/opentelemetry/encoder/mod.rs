@@ -57,19 +57,6 @@ use super::config::OpenTelemetryConfig;
 #[derive(Debug, Clone)]
 pub(super) struct OtlpEncoder {}
 
-/// Normalizer that converts all metrics to absolute (cumulative) values
-/// This follows Vector's standard pattern used by Prometheus and other sinks
-#[derive(Default)]
-struct OtlpMetricNormalize;
-
-impl MetricNormalize for OtlpMetricNormalize {
-    fn normalize(&mut self, state: &mut MetricSet, metric: VectorMetric) -> Option<VectorMetric> {
-        // Convert all metrics to absolute (cumulative) for consistent OTLP semantics
-        // This matches the behavior of Prometheus sink and provides proper start_time
-        state.make_absolute(metric)
-    }
-}
-
 impl OtlpEncoder {
     /// Creates a new `OtlpEncoder`.
     pub(super) fn new(_otlp_config: OpenTelemetryConfig) -> Self {
@@ -407,6 +394,19 @@ impl ResourceAttributeExtractor for TraceEvent {
         };
 
         resource_attrs
+    }
+}
+
+/// Normalizer that converts all metrics to absolute (cumulative) values
+/// This follows Vector's standard pattern used by Prometheus and other sinks
+#[derive(Default)]
+struct OtlpMetricNormalize;
+
+impl MetricNormalize for OtlpMetricNormalize {
+    fn normalize(&mut self, state: &mut MetricSet, metric: VectorMetric) -> Option<VectorMetric> {
+        // Convert all metrics to absolute (cumulative) for consistent OTLP semantics
+        // This matches the behavior of Prometheus sink and provides proper start_time
+        state.make_absolute(metric)
     }
 }
 

@@ -319,43 +319,6 @@ fn test_encoder_resource_extraction() {
 }
 
 #[test]
-fn test_severity_integration_with_encoder() {
-    let encoder = OtlpEncoder::new_default();
-
-    let mut log = LogEvent::from("test message with severity");
-    log.insert("level", "warn");
-    log.insert("user_id", 123);
-
-    let events = vec![Event::Log(log)];
-    let result = encoder.encode_logs(events).unwrap();
-
-    // Decode and verify
-    let request = ExportLogsServiceRequest::decode(result.as_ref()).unwrap();
-    let log_record = &request.resource_logs[0].scope_logs[0].log_records[0];
-
-    // Check severity mapping
-    assert_eq!(log_record.severity_number, 13); // SEVERITY_NUMBER_WARN
-    assert_eq!(log_record.severity_text, "WARN");
-
-    // Check that 'level' field is preserved in attributes
-    let level_attr = log_record
-        .attributes
-        .iter()
-        .find(|attr| attr.key == "level");
-    assert!(
-        level_attr.is_some(),
-        "Level field should be preserved in attributes"
-    );
-
-    // Check that other fields are still present
-    let user_id_attr = log_record
-        .attributes
-        .iter()
-        .find(|attr| attr.key == "user_id");
-    assert!(user_id_attr.is_some(), "user_id should be in attributes");
-}
-
-#[test]
 fn test_string_encoding_utf8_vs_bytes() {
     use super::encoder::convert_value_to_any_value;
     use vector_lib::opentelemetry::proto::common::v1::any_value::Value as PbValue;

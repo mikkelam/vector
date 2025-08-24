@@ -1,8 +1,6 @@
 use crate::sinks::opentelemetry::encoder::NumberDataPointValue;
 use crate::sinks::opentelemetry::encoder::OtlpEncoder;
-use crate::sinks::opentelemetry::encoder::PbValue;
-use crate::sinks::opentelemetry::encoder::ResourceAttributeExtractor;
-use crate::sinks::opentelemetry::encoder::VectorMetric;
+
 use crate::sinks::util::encoding::Encoder;
 
 use prost::Message;
