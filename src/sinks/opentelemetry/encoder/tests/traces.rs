@@ -241,6 +241,50 @@ fn test_timestamp_parsing_and_fallbacks() {
         assert_eq!(span.end_time_unix_nano, 0);
     }
 }
+#[test]
+fn numeric_kind_and_status_object_precedence() {
+    // Build a trace event with numeric kind and a status object
+    let mut m = BTreeMap::new();
+    // valid IDs (hex strings)
+    m.insert(
+        "trace_id".into(),
+        Value::from("00112233445566778899aabbccddeeff"),
+    );
+    m.insert("span_id".into(), Value::from("0011223344556677"));
+    // numeric kind = Server (2)
+    m.insert("kind".into(), Value::from(2));
+    // conflicting tag says OK, but status object should take precedence to ERROR
+    m.insert(
+        "tags".into(),
+        Value::from(BTreeMap::from([(
+            "otel.status_code".into(),
+            Value::from("ok"),
+        )])),
+    );
+    m.insert(
+        "status".into(),
+        Value::from(BTreeMap::from([
+            ("code".into(), Value::from(2)),
+            ("message".into(), Value::from("boom")),
+        ])),
+    );
+
+    let event = Event::Trace(TraceEvent::from(m));
+    let enc = OtlpEncoder::new_default();
+    let mut buf = Vec::new();
+    assert!(enc.encode_input(vec![event], &mut buf).is_ok());
+
+    let req = ExportTraceServiceRequest::decode(buf.as_slice()).unwrap();
+    let span = &req.resource_spans[0].scope_spans[0].spans[0];
+
+    // Numeric kind passed through
+    assert_eq!(span.kind, SpanKind::Server as i32);
+
+    // Status object takes precedence over tag-derived status
+    let status = span.status.as_ref().expect("status must be set");
+    assert_eq!(status.code, 2);
+    assert_eq!(status.message, "boom");
+}
 
 #[test]
 fn test_attributes_resources_events_links() {

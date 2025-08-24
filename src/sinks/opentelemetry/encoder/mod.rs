@@ -756,14 +756,21 @@ fn convert_vector_trace_to_otlp_span(trace: TraceEvent) -> Span {
     // Map string kind to OTLP span kind enum
     let kind = trace_map
         .get("kind")
-        .and_then(|v| v.as_str())
-        .map(|kind_str| match kind_str.to_lowercase().as_str() {
-            "server" => SpanKind::Server as i32,
-            "client" => SpanKind::Client as i32,
-            "producer" => SpanKind::Producer as i32,
-            "consumer" => SpanKind::Consumer as i32,
-            "internal" => SpanKind::Internal as i32,
-            _ => SpanKind::Internal as i32,
+        .map(|v| {
+            if let Some(n) = v.as_integer() {
+                n as i32
+            } else if let Some(s) = v.as_str() {
+                match s.to_lowercase().as_str() {
+                    "server" => SpanKind::Server as i32,
+                    "client" => SpanKind::Client as i32,
+                    "producer" => SpanKind::Producer as i32,
+                    "consumer" => SpanKind::Consumer as i32,
+                    "internal" => SpanKind::Internal as i32,
+                    _ => SpanKind::Internal as i32,
+                }
+            } else {
+                SpanKind::Internal as i32
+            }
         })
         .unwrap_or(SpanKind::Internal as i32);
 
@@ -835,6 +842,24 @@ fn convert_vector_trace_to_otlp_span(trace: TraceEvent) -> Span {
                     }
                 }
             }
+        }
+    }
+    // If a status object is present, let it take precedence over tag-derived status
+    if let Some(status_obj) = trace_map.get("status").and_then(|v| v.as_object()) {
+        if let Some(code_val) = status_obj.get("code") {
+            if let Some(code_int) = code_val.as_integer() {
+                status_code = code_int as i32;
+            } else if let Some(code_str) = code_val.as_str() {
+                status_code = match code_str.to_lowercase().as_str() {
+                    "error" => 2,
+                    "ok" => 1,
+                    "unset" => 0,
+                    _ => status_code,
+                };
+            }
+        }
+        if let Some(msg) = status_obj.get("message").and_then(|v| v.as_str()) {
+            status_message = msg.to_string();
         }
     }
 
