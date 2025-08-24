@@ -9,6 +9,8 @@ use chrono::{DateTime, Utc};
 use hex;
 
 use prost::Message;
+use vector_common::internal_event::InternalEvent;
+
 use vector_lib::opentelemetry::{
     logs as otlp_logs,
     proto::{
@@ -41,10 +43,7 @@ use crate::{
         Event, LogEvent, Metric as VectorMetric, MetricTags, MetricValue, TraceEvent,
         metric::{Bucket, MetricSketch, Quantile, Sample},
     },
-    sinks::{
-        prelude::*,
-        util::buffer::metrics::{MetricNormalize, MetricSet},
-    },
+    sinks::prelude::*,
 };
 
 use super::config::OpenTelemetryConfig;
@@ -101,23 +100,14 @@ impl OtlpEncoder {
                 let mut metric = e.into_metric();
                 let resource_attrs = metric.extract_resource_attributes();
 
-                // Apply normalization to convert incremental metrics to absolute
-                let mut normalizer = OtlpMetricNormalize;
-                let mut metric_state = MetricSet::default();
-
-                normalizer
-                    .normalize(&mut metric_state, metric)
-                    .map(|normalized_metric| {
-                        let otlp_metric = convert_vector_metric_to_otlp(normalized_metric);
-                        ResourceMetrics {
-                            resource: Some(Resource {
-                                attributes: resource_attrs,
-                                dropped_attributes_count: 0,
-                            }),
-                            scope_metrics: vec![self.create_scope_metrics(vec![otlp_metric])],
-                            schema_url: String::new(),
-                        }
-                    })
+                convert_vector_metric_to_otlp(metric).map(|otlp_metric| ResourceMetrics {
+                    resource: Some(Resource {
+                        attributes: resource_attrs,
+                        dropped_attributes_count: 0,
+                    }),
+                    scope_metrics: vec![self.create_scope_metrics(vec![otlp_metric])],
+                    schema_url: String::new(),
+                })
             })
             .collect();
 
@@ -274,14 +264,20 @@ impl ResourceAttributeExtractor for TraceEvent {
 
 /// Normalizer that converts all metrics to absolute (cumulative) values
 /// This follows Vector's standard pattern used by Prometheus and other sinks
-#[derive(Default)]
-struct OtlpMetricNormalize;
 
-impl MetricNormalize for OtlpMetricNormalize {
-    fn normalize(&mut self, state: &mut MetricSet, metric: VectorMetric) -> Option<VectorMetric> {
-        // Convert all metrics to absolute (cumulative) for consistent OTLP semantics
-        // This matches the behavior of Prometheus sink and provides proper start_time
-        state.make_absolute(metric)
+// Internal event for dropped Set metrics
+#[derive(Debug)]
+struct OtlpUnsupportedSetMetricDropped {
+    name: String,
+}
+
+impl InternalEvent for OtlpUnsupportedSetMetricDropped {
+    fn emit(self) {
+        warn!(
+            message = "Unsupported metric type for OTLP: Set. Dropping.",
+            metric_name = %self.name,
+            internal_log_rate_limit = true,
+        );
     }
 }
 
@@ -330,7 +326,7 @@ fn convert_object_map_to_key_value_vec(map: ObjectMap) -> Vec<KeyValue> {
 }
 
 /// Converts a Vector Metric into an OTLP Metric.
-fn convert_vector_metric_to_otlp(metric: VectorMetric) -> OtlpMetric {
+fn convert_vector_metric_to_otlp(metric: VectorMetric) -> Option<OtlpMetric> {
     let name = metric.name().to_string();
     let description = String::new(); // Vector metrics don't have descriptions
     let unit = String::new(); // Vector metrics don't have units
@@ -338,49 +334,74 @@ fn convert_vector_metric_to_otlp(metric: VectorMetric) -> OtlpMetric {
     let attributes = convert_metric_tags_to_attributes(metric.tags());
     let time_unix_nano = convert_timestamp_to_nanos(metric.timestamp());
 
+    // Map Vector MetricKind to OTLP AggregationTemporality:
+    // - Incremental -> Delta
+    // - Absolute    -> Cumulative
+    let temporality = match metric.kind() {
+        crate::event::MetricKind::Incremental => AggregationTemporality::Delta as i32,
+        crate::event::MetricKind::Absolute => AggregationTemporality::Cumulative as i32,
+    };
+
     let data = match metric.value() {
         MetricValue::Counter { value } => {
-            convert_counter_to_otlp(&attributes, time_unix_nano, *value)
+            convert_counter_to_otlp(&attributes, time_unix_nano, *value, temporality)
         }
         MetricValue::Gauge { value } => convert_gauge_to_otlp(&attributes, time_unix_nano, *value),
         MetricValue::AggregatedHistogram {
             buckets,
             count,
             sum,
-        } => convert_histogram_to_otlp(&attributes, time_unix_nano, buckets, *count, *sum),
+        } => convert_histogram_to_otlp(
+            &attributes,
+            time_unix_nano,
+            buckets,
+            *count,
+            *sum,
+            temporality,
+        ),
         MetricValue::AggregatedSummary {
             quantiles,
             count,
             sum,
         } => convert_summary_to_otlp(&attributes, time_unix_nano, quantiles, *count, *sum),
-        MetricValue::Set { values } => {
-            convert_set_to_otlp(&attributes, time_unix_nano, values.len())
+        MetricValue::Set { .. } => {
+            // No natural way to represent a set metric in OTLP
+            emit!(OtlpUnsupportedSetMetricDropped { name: name.clone() });
+            return None;
         }
         MetricValue::Distribution {
             samples,
             statistic: _,
-        } => convert_distribution_to_otlp(&attributes, time_unix_nano, samples),
+        } => convert_distribution_to_otlp(&attributes, time_unix_nano, samples, temporality),
         MetricValue::Sketch { sketch } => {
+            // Sketch exported as cumulative histogram approximation
             convert_sketch_to_otlp(&attributes, time_unix_nano, sketch)
         }
     };
 
-    OtlpMetric {
+    Some(OtlpMetric {
         name,
         description,
         unit,
         data,
-    }
+    })
 }
 
 fn convert_metric_tags_to_attributes(tags: Option<&MetricTags>) -> Vec<KeyValue> {
     if let Some(tags) = tags {
         tags.iter_all()
-            .map(|(key, value)| KeyValue {
-                key: key.to_string(),
-                value: Some(AnyValue {
-                    value: Some(PbValue::StringValue(value.unwrap_or("").to_string())),
-                }),
+            .filter_map(|(key, value)| {
+                // Do not duplicate resource.* or scope.* tags at the point level
+                if key.starts_with("resource.") || key.starts_with("scope.") {
+                    None
+                } else {
+                    Some(KeyValue {
+                        key: key.to_string(),
+                        value: Some(AnyValue {
+                            value: Some(PbValue::StringValue(value.unwrap_or("").to_string())),
+                        }),
+                    })
+                }
             })
             .collect()
     } else {
@@ -398,15 +419,12 @@ fn convert_counter_to_otlp(
     attributes: &[KeyValue],
     time_unix_nano: u64,
     value: f64,
+    aggregation_temporality: i32,
 ) -> Option<Data> {
-    // NOTE: All metrics are normalized to absolute (cumulative) values using Vector's
-    // standard MetricSet normalization, so we always use Cumulative temporality.
-    // start_time_unix_nano = 0 indicates the metric has been cumulative since an
-    // unknown start time, which is semantically correct for normalized counters.
     let data_point = NumberDataPoint {
         attributes: attributes.to_vec(),
         time_unix_nano,
-        start_time_unix_nano: 0, // Cumulative since unknown start time
+        start_time_unix_nano: 0,
         value: Some(NumberDataPointValue::AsDouble(value)),
         exemplars: Vec::new(),
         flags: 0,
@@ -414,8 +432,8 @@ fn convert_counter_to_otlp(
 
     Some(Data::Sum(Sum {
         data_points: vec![data_point],
-        aggregation_temporality: AggregationTemporality::Cumulative as i32,
-        is_monotonic: true, // Counters are always monotonic
+        aggregation_temporality,
+        is_monotonic: true, // Counter is monotonic
     }))
 }
 
@@ -440,7 +458,17 @@ fn convert_histogram_to_otlp(
     buckets: &[Bucket],
     count: u64,
     sum: f64,
+    aggregation_temporality: i32,
 ) -> Option<Data> {
+    // Assumptions and OTLP invariants:
+    // - `buckets` are sorted by ascending `upper_limit`, with the final bucket at +∞.
+    // - We build `explicit_bounds` from all non-infinite upper limits, and `bucket_counts`
+    //   from every bucket (including the +∞ bucket), yielding:
+    //     bucket_counts.len() == explicit_bounds.len() + 1
+    //     sum(bucket_counts)  == count
+    // - OTLP bucket intervals are:
+    //     (-∞, b0], (b0, b1], …, (bN-1, +∞)
+    //   i.e. upper bound inclusive, matching Vector’s AggregatedHistogram by `upper_limit`.
     let mut explicit_bounds = Vec::new();
     let mut bucket_counts = Vec::new();
 
@@ -451,10 +479,15 @@ fn convert_histogram_to_otlp(
         bucket_counts.push(bucket.count);
     }
 
+    debug_assert_eq!(
+        bucket_counts.iter().copied().sum::<u64>(),
+        count,
+        "sum(bucket_counts) must equal count"
+    );
     let data_point = HistogramDataPoint {
         attributes: attributes.to_vec(),
         time_unix_nano,
-        start_time_unix_nano: 0, // Cumulative since unknown start time
+        start_time_unix_nano: 0,
         count,
         sum: Some(sum),
         bucket_counts,
@@ -467,7 +500,7 @@ fn convert_histogram_to_otlp(
 
     Some(Data::Histogram(Histogram {
         data_points: vec![data_point],
-        aggregation_temporality: AggregationTemporality::Cumulative as i32,
+        aggregation_temporality,
     }))
 }
 
@@ -501,30 +534,11 @@ fn convert_summary_to_otlp(
     }))
 }
 
-fn convert_set_to_otlp(
-    attributes: &[KeyValue],
-    time_unix_nano: u64,
-    cardinality: usize,
-) -> Option<Data> {
-    // Convert set to gauge representing cardinality (number of unique values)
-    let data_point = NumberDataPoint {
-        attributes: attributes.to_vec(),
-        time_unix_nano,
-        start_time_unix_nano: 0, // Gauges don't have start times
-        value: Some(NumberDataPointValue::AsDouble(cardinality as f64)),
-        exemplars: Vec::new(),
-        flags: 0,
-    };
-
-    Some(Data::Gauge(Gauge {
-        data_points: vec![data_point],
-    }))
-}
-
 fn convert_distribution_to_otlp(
     attributes: &[KeyValue],
     time_unix_nano: u64,
     samples: &[Sample],
+    aggregation_temporality: i32,
 ) -> Option<Data> {
     // Convert distribution to histogram by creating buckets
     // This is a basic conversion - in practice you might want more sophisticated bucketing
@@ -552,16 +566,22 @@ fn convert_distribution_to_otlp(
             }
         }
 
-        // Increment all buckets up to and including the target bucket
-        for bucket_count in bucket_counts.iter_mut().skip(bucket_index) {
-            *bucket_count += 1;
+        // Increment only the matched bucket (non-cumulative per-bucket counts)
+        let last_index = bucket_counts.len().saturating_sub(1);
+        let idx = if bucket_index > last_index {
+            last_index
+        } else {
+            bucket_index
+        };
+        if let Some(slot) = bucket_counts.get_mut(idx) {
+            *slot += 1;
         }
     }
 
     let data_point = HistogramDataPoint {
         attributes: attributes.to_vec(),
         time_unix_nano,
-        start_time_unix_nano: 0, // Cumulative since unknown start time
+        start_time_unix_nano: 0,
         count,
         sum: Some(sum),
         bucket_counts,
@@ -582,7 +602,7 @@ fn convert_distribution_to_otlp(
 
     Some(Data::Histogram(Histogram {
         data_points: vec![data_point],
-        aggregation_temporality: AggregationTemporality::Cumulative as i32,
+        aggregation_temporality,
     }))
 }
 

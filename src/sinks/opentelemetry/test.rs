@@ -99,7 +99,10 @@ endpoint = "{}"
 
     let mut log = LogEvent::from("hello otlp");
     log.insert("host", "example.com");
-    log.insert(event_path!("resource", "service.name"), "vector-test-suite");
+    log.insert(
+        event_path!("resources", "service.name"),
+        "vector-test-suite",
+    );
 
     let event = Event::Log(log);
     run_and_assert_sink_compliance(sink, stream::once(async { event }), &SINK_TAGS).await;
@@ -283,39 +286,6 @@ endpoint = "{}"
     assert!(otlp_span.start_time_unix_nano > 0);
     assert!(otlp_span.end_time_unix_nano > 0);
     assert!(otlp_span.end_time_unix_nano > otlp_span.start_time_unix_nano);
-}
-
-#[test]
-fn test_encoder_resource_extraction() {
-    let encoder = OtlpEncoder::new_default();
-
-    let mut log = LogEvent::from("test message");
-    log.insert("host", "example.com");
-    log.insert(event_path!("resource", "service.name"), "vector-test-suite");
-
-    let events = vec![Event::Log(log)];
-    let result = encoder.encode_logs(events).unwrap();
-
-    // Decode the protobuf to verify structure
-    let request = ExportLogsServiceRequest::decode(result.as_ref()).unwrap();
-
-    // Check that we have resource attributes
-    assert_eq!(request.resource_logs.len(), 1);
-    let resource_log = &request.resource_logs[0];
-    let resource = resource_log.resource.as_ref().unwrap();
-
-    // Should have the service.name resource attribute
-    assert_eq!(resource.attributes.len(), 1);
-    let resource_attr = &resource.attributes[0];
-    assert_eq!(resource_attr.key, "service.name");
-    assert_eq!(
-        resource_attr.value.as_ref().unwrap().value,
-        Some(
-            vector_lib::opentelemetry::proto::common::v1::any_value::Value::StringValue(
-                "vector-test-suite".to_string()
-            )
-        )
-    );
 }
 
 #[test]
@@ -547,65 +517,6 @@ fn test_encode_metrics_gauge() {
         }
     } else {
         panic!("Expected Gauge metric data");
-    }
-}
-
-#[test]
-fn test_encode_metrics_histogram() {
-    use crate::event::metric::Bucket;
-    use crate::event::{Metric, MetricKind, MetricValue};
-    use vector_lib::opentelemetry::proto::collector::metrics::v1::ExportMetricsServiceRequest;
-
-    let encoder = OtlpEncoder::new_default();
-
-    let buckets = vec![
-        Bucket {
-            upper_limit: 1.0,
-            count: 10,
-        },
-        Bucket {
-            upper_limit: 5.0,
-            count: 25,
-        },
-        Bucket {
-            upper_limit: f64::INFINITY,
-            count: 30,
-        },
-    ];
-
-    let metric = Metric::new(
-        "test_histogram",
-        MetricKind::Absolute,
-        MetricValue::AggregatedHistogram {
-            buckets,
-            count: 30,
-            sum: 100.0,
-        },
-    );
-
-    let events = vec![Event::Metric(metric)];
-    let result = encoder.encode_metrics(events).unwrap();
-
-    let request = ExportMetricsServiceRequest::decode(result.as_ref()).unwrap();
-    let otlp_metric = &request.resource_metrics[0].scope_metrics[0].metrics[0];
-
-    assert_eq!(otlp_metric.name, "test_histogram");
-
-    // Should be a Histogram metric
-    if let Some(vector_lib::opentelemetry::proto::metrics::v1::metric::Data::Histogram(histogram)) =
-        &otlp_metric.data
-    {
-        assert_eq!(histogram.data_points.len(), 1);
-
-        let data_point = &histogram.data_points[0];
-        assert_eq!(data_point.count, 30);
-        assert_eq!(data_point.sum, Some(100.0));
-
-        // Check buckets - should have explicit bounds [1.0, 5.0] (infinity excluded)
-        assert_eq!(data_point.explicit_bounds, vec![1.0, 5.0]);
-        assert_eq!(data_point.bucket_counts, vec![10, 25, 30]);
-    } else {
-        panic!("Expected Histogram metric data");
     }
 }
 

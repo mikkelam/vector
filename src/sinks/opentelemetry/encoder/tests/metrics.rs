@@ -1,4 +1,3 @@
-use crate::sinks::opentelemetry::encoder::NumberDataPointValue;
 use crate::sinks::opentelemetry::encoder::OtlpEncoder;
 
 use crate::sinks::util::encoding::Encoder;
@@ -7,235 +6,323 @@ use prost::Message;
 use vector_lib::event::Event;
 
 #[test]
-fn test_set_distribution_sketch_metrics() {
-    use crate::event::metric::{MetricSketch, Sample, StatisticKind};
+fn test_metric_resource_attributes_not_duplicated() {
     use crate::event::{Metric, MetricKind, MetricValue};
-    use crate::metrics::AgentDDSketch;
     use chrono::Utc;
-    use std::collections::BTreeSet;
-    use vector_lib::opentelemetry::proto::{
-        collector::metrics::v1::ExportMetricsServiceRequest, metrics::v1::metric::Data,
-    };
+    use vector_lib::opentelemetry::proto::collector::metrics::v1::ExportMetricsServiceRequest;
 
     let encoder = OtlpEncoder::new_default();
 
-    // Test Set metric (converted to gauge with cardinality)
-    let mut set_values = BTreeSet::new();
-    set_values.insert("value1".to_string());
-    set_values.insert("value2".to_string());
-    set_values.insert("value3".to_string());
-
-    let set_metric = Event::Metric(
-        Metric::new(
-            "test_set",
-            MetricKind::Absolute,
-            MetricValue::Set { values: set_values },
-        )
-        .with_timestamp(Some(Utc::now())),
+    // Build tags with resource.* and a normal tag
+    let mut tags = crate::event::MetricTags::default();
+    tags.insert(
+        "resource.service.name".to_string(),
+        crate::event::metric::TagValue::from("svc-x"),
+    );
+    tags.insert(
+        "resource.host.name".to_string(),
+        crate::event::metric::TagValue::from("host-x"),
+    );
+    tags.insert(
+        "env".to_string(),
+        crate::event::metric::TagValue::from("prod"),
     );
 
-    // Test Distribution metric (converted to histogram)
-    let distribution_metric = Event::Metric(
+    let metric = Event::Metric(
         Metric::new(
-            "test_distribution",
+            "resource_test_gauge",
             MetricKind::Absolute,
-            MetricValue::Distribution {
-                samples: vec![
-                    Sample {
-                        value: 1.0,
-                        rate: 1,
-                    },
-                    Sample {
-                        value: 5.0,
-                        rate: 1,
-                    },
-                    Sample {
-                        value: 10.0,
-                        rate: 1,
-                    },
-                ],
-                statistic: StatisticKind::Histogram,
-            },
+            MetricValue::Gauge { value: 1.0 },
         )
-        .with_timestamp(Some(Utc::now())),
-    );
-
-    // Test Sketch metric (converted to histogram)
-    let mut ddsketch = AgentDDSketch::with_agent_defaults();
-    ddsketch.insert_many(&[1.0, 2.0, 3.0, 4.0, 5.0]);
-
-    let sketch_metric = Event::Metric(
-        Metric::new(
-            "test_sketch",
-            MetricKind::Absolute,
-            MetricValue::Sketch {
-                sketch: MetricSketch::AgentDDSketch(ddsketch),
-            },
-        )
+        .with_tags(Some(tags))
         .with_timestamp(Some(Utc::now())),
     );
 
     let mut buf = Vec::new();
-    let result = encoder.encode_input(
-        vec![set_metric, distribution_metric, sketch_metric],
-        &mut buf,
-    );
+    let result = encoder.encode_input(vec![metric], &mut buf);
     assert!(result.is_ok());
 
     let request = ExportMetricsServiceRequest::decode(buf.as_slice()).unwrap();
+    assert_eq!(request.resource_metrics.len(), 1);
 
-    assert_eq!(request.resource_metrics.len(), 3);
+    let rm = &request.resource_metrics[0];
+    let resource = rm.resource.as_ref().expect("resource present");
+    let has_res = |k: &str| resource.attributes.iter().any(|kv| kv.key == k);
+    // Resource-level attributes should contain stripped keys
+    assert!(has_res("service.name"));
+    assert!(has_res("host.name"));
 
-    // Find each metric by name since order isn't guaranteed
-    let mut set_metric = None;
-    let mut distribution_metric = None;
-    let mut sketch_metric = None;
+    // Data point attributes should not include resource.* or stripped resource keys
+    let scope_metrics = &rm.scope_metrics[0];
+    let metric = &scope_metrics.metrics[0];
+    if let Some(vector_lib::opentelemetry::proto::metrics::v1::metric::Data::Gauge(g)) =
+        &metric.data
+    {
+        let attrs = &g.data_points[0].attributes;
+        let has = |k: &str| attrs.iter().any(|kv| kv.key == k);
 
-    for resource_metric in &request.resource_metrics {
-        assert_eq!(resource_metric.scope_metrics.len(), 1);
-        let scope_metrics = &resource_metric.scope_metrics[0];
-        assert_eq!(scope_metrics.metrics.len(), 1);
-        let metric = &scope_metrics.metrics[0];
+        // Normal tag remains at point level
+        assert!(has("env"));
 
-        match metric.name.as_str() {
-            "test_set" => set_metric = Some(metric),
-            "test_distribution" => distribution_metric = Some(metric),
-            "test_sketch" => sketch_metric = Some(metric),
-            _ => panic!("Unexpected metric name: {}", metric.name),
-        }
-    }
+        // No resource.* keys leaked
+        assert!(!has("resource.service.name"));
+        assert!(!has("resource.host.name"));
 
-    // Validate set metric (converted to gauge)
-    let set_metric = set_metric.unwrap();
-    assert_eq!(set_metric.name, "test_set");
-    if let Some(Data::Gauge(gauge)) = &set_metric.data {
-        assert_eq!(gauge.data_points.len(), 1);
-        let data_point = &gauge.data_points[0];
-        // Should have cardinality of 3
-        if let Some(NumberDataPointValue::AsDouble(val)) = &data_point.value {
-            assert_eq!(*val, 3.0);
-        }
+        // And not duplicated as stripped keys at point level
+        assert!(!has("service.name"));
+        assert!(!has("host.name"));
     } else {
-        panic!("Expected set to have Gauge data");
-    }
-
-    // Validate distribution metric (converted to histogram)
-    let distribution_metric = distribution_metric.unwrap();
-    assert_eq!(distribution_metric.name, "test_distribution");
-    if let Some(Data::Histogram(hist)) = &distribution_metric.data {
-        assert_eq!(hist.data_points.len(), 1);
-        let data_point = &hist.data_points[0];
-        assert_eq!(data_point.count, 3);
-        assert_eq!(data_point.sum, Some(16.0)); // 1.0 + 5.0 + 10.0
-    } else {
-        panic!("Expected distribution to have Histogram data");
-    }
-
-    // Validate sketch metric (converted to histogram)
-    let sketch_metric = sketch_metric.unwrap();
-    assert_eq!(sketch_metric.name, "test_sketch");
-    if let Some(Data::Histogram(hist)) = &sketch_metric.data {
-        assert_eq!(hist.data_points.len(), 1);
-        let data_point = &hist.data_points[0];
-        assert_eq!(data_point.count, 5);
-        assert_eq!(data_point.sum, Some(15.0)); // 1.0 + 2.0 + 3.0 + 4.0 + 5.0
-    } else {
-        panic!("Expected sketch to have Histogram data");
+        panic!("Expected Gauge metric data");
     }
 }
 
 #[test]
-fn test_incremental_metric_normalization() {
+fn test_counter_sum_encoding_temporality_monotonic_timestamps_and_attributes() {
     use crate::event::{Metric, MetricKind, MetricValue};
     use chrono::Utc;
-    use vector_lib::opentelemetry::proto::{
-        collector::metrics::v1::ExportMetricsServiceRequest,
-        metrics::v1::{AggregationTemporality, metric::Data},
+    use vector_lib::opentelemetry::proto::collector::metrics::v1::ExportMetricsServiceRequest;
+    use vector_lib::opentelemetry::proto::metrics::v1::{
+        AggregationTemporality, metric::Data, number_data_point::Value as NumberValue,
     };
 
     let encoder = OtlpEncoder::new_default();
 
-    // Test that absolute metrics pass through unchanged
-    let absolute_counter = Event::Metric(
+    // Build tags with a resource attribute and a normal tag
+    let mut tags_abs = crate::event::MetricTags::default();
+    tags_abs.insert(
+        "resource.service.name".to_string(),
+        crate::event::metric::TagValue::from("svc-a"),
+    );
+    tags_abs.insert(
+        "env".to_string(),
+        crate::event::metric::TagValue::from("prod"),
+    );
+
+    let mut tags_delta = crate::event::MetricTags::default();
+    tags_delta.insert(
+        "resource.service.name".to_string(),
+        crate::event::metric::TagValue::from("svc-b"),
+    );
+    tags_delta.insert(
+        "env".to_string(),
+        crate::event::metric::TagValue::from("stage"),
+    );
+
+    let ts_abs = Utc::now();
+    let ts_delta = Utc::now();
+
+    // Absolute counter -> Cumulative Sum
+    let abs_counter = Event::Metric(
         Metric::new(
-            "test_counter",
+            "abs_counter",
             MetricKind::Absolute,
             MetricValue::Counter { value: 42.0 },
         )
-        .with_timestamp(Some(Utc::now())),
+        .with_tags(Some(tags_abs))
+        .with_timestamp(Some(ts_abs)),
     );
 
-    // Test that incremental metrics get converted to absolute via normalization
-    let incremental_counter = Event::Metric(
+    // Incremental counter -> Delta Sum
+    let delta_counter = Event::Metric(
         Metric::new(
-            "test_incremental",
+            "delta_counter",
             MetricKind::Incremental,
-            MetricValue::Counter { value: 10.0 },
+            MetricValue::Counter { value: 5.0 },
         )
-        .with_timestamp(Some(Utc::now())),
+        .with_tags(Some(tags_delta))
+        .with_timestamp(Some(ts_delta)),
     );
 
     let mut buf = Vec::new();
-    let result = encoder.encode_input(vec![absolute_counter, incremental_counter], &mut buf);
+    let result = encoder.encode_input(vec![abs_counter, delta_counter], &mut buf);
     assert!(result.is_ok());
 
     let request = ExportMetricsServiceRequest::decode(buf.as_slice()).unwrap();
-
     assert_eq!(request.resource_metrics.len(), 2);
 
-    // Check each ResourceMetrics has the expected structure
-    for resource_metric in &request.resource_metrics {
-        assert_eq!(resource_metric.scope_metrics.len(), 1);
-        let scope_metrics = &resource_metric.scope_metrics[0];
-        assert_eq!(scope_metrics.metrics.len(), 1);
-
-        // All metrics should use cumulative temporality
-        let metric = &scope_metrics.metrics[0];
-        if let Some(Data::Sum(sum)) = &metric.data {
-            assert_eq!(
-                sum.aggregation_temporality,
-                AggregationTemporality::Cumulative as i32
-            );
+    // Collect by metric name
+    let mut abs = None;
+    let mut delta = None;
+    for rm in &request.resource_metrics {
+        assert_eq!(rm.scope_metrics.len(), 1);
+        let metric = &rm.scope_metrics[0].metrics[0];
+        match metric.name.as_str() {
+            "abs_counter" => abs = Some((rm, metric)),
+            "delta_counter" => delta = Some((rm, metric)),
+            other => panic!("unexpected metric: {}", other),
         }
+    }
+
+    // Validate absolute counter => Cumulative Sum, monotonic, timestamps, attributes
+    let (rm_abs, m_abs) = abs.expect("abs_counter present");
+    // Resource attribute present and stripped
+    let res_abs = rm_abs.resource.as_ref().expect("resource present");
+    assert!(res_abs.attributes.iter().any(|kv| kv.key == "service.name"));
+
+    if let Some(Data::Sum(sum)) = &m_abs.data {
+        assert_eq!(
+            sum.aggregation_temporality,
+            AggregationTemporality::Cumulative as i32
+        );
+        assert!(sum.is_monotonic);
+        assert_eq!(sum.data_points.len(), 1);
+        let dp = &sum.data_points[0];
+
+        // time_unix_nano matches, start_time_unix_nano is 0
+        assert_eq!(
+            dp.time_unix_nano,
+            ts_abs.timestamp_nanos_opt().unwrap() as u64
+        );
+        assert_eq!(dp.start_time_unix_nano, 0);
+
+        // value is correct
+        match dp.value.as_ref() {
+            Some(NumberValue::AsDouble(v)) => assert_eq!(*v, 42.0),
+            other => panic!("expected AsDouble(42.0), got {:?}", other),
+        }
+
+        // point attributes contain normal tag, not resource
+        let has = |k: &str| dp.attributes.iter().any(|kv| kv.key == k);
+        assert!(has("env"));
+        assert!(!has("resource.service.name"));
+        assert!(!has("service.name"));
+    } else {
+        panic!("expected Sum for abs_counter");
+    }
+
+    // Validate incremental counter => Delta Sum, monotonic, timestamps, attributes
+    let (rm_delta, m_delta) = delta.expect("delta_counter present");
+    // Resource attribute present and stripped
+    let res_delta = rm_delta.resource.as_ref().expect("resource present");
+    assert!(
+        res_delta
+            .attributes
+            .iter()
+            .any(|kv| kv.key == "service.name")
+    );
+
+    if let Some(Data::Sum(sum)) = &m_delta.data {
+        assert_eq!(
+            sum.aggregation_temporality,
+            AggregationTemporality::Delta as i32
+        );
+        assert!(sum.is_monotonic);
+        assert_eq!(sum.data_points.len(), 1);
+        let dp = &sum.data_points[0];
+
+        // time_unix_nano matches, start_time_unix_nano is 0
+        assert_eq!(
+            dp.time_unix_nano,
+            ts_delta.timestamp_nanos_opt().unwrap() as u64
+        );
+        assert_eq!(dp.start_time_unix_nano, 0);
+
+        // value is correct
+        match dp.value.as_ref() {
+            Some(NumberValue::AsDouble(v)) => assert_eq!(*v, 5.0),
+            other => panic!("expected AsDouble(5.0), got {:?}", other),
+        }
+
+        // point attributes contain normal tag, not resource
+        let has = |k: &str| dp.attributes.iter().any(|kv| kv.key == k);
+        assert!(has("env"));
+        assert!(!has("resource.service.name"));
+        assert!(!has("service.name"));
+    } else {
+        panic!("expected Sum for delta_counter");
     }
 }
 
 #[test]
-fn test_metrics_conversion() {
-    use crate::event::metric::Bucket;
+fn test_gauge_encoding_timestamps_and_attributes() {
     use crate::event::{Metric, MetricKind, MetricValue};
     use chrono::Utc;
-    use vector_lib::opentelemetry::proto::{
-        collector::metrics::v1::ExportMetricsServiceRequest,
-        metrics::v1::{AggregationTemporality, metric::Data},
+    use vector_lib::opentelemetry::proto::collector::metrics::v1::ExportMetricsServiceRequest;
+    use vector_lib::opentelemetry::proto::metrics::v1::{
+        metric::Data, number_data_point::Value as NumberValue,
     };
 
     let encoder = OtlpEncoder::new_default();
 
-    // Test Counter metric (using Absolute to avoid normalization dropping)
-    let counter = Event::Metric(
-        Metric::new(
-            "test_counter",
-            MetricKind::Absolute,
-            MetricValue::Counter { value: 42.0 },
-        )
-        .with_timestamp(Some(Utc::now())),
+    // Build tags with a resource attribute and a normal tag
+    let mut tags = crate::event::MetricTags::default();
+    tags.insert(
+        "resource.service.name".to_string(),
+        crate::event::metric::TagValue::from("svc-g"),
+    );
+    tags.insert(
+        "env".to_string(),
+        crate::event::metric::TagValue::from("prod"),
     );
 
-    // Test Gauge metric
+    let ts = Utc::now();
+
     let gauge = Event::Metric(
         Metric::new(
-            "test_gauge",
+            "g1",
             MetricKind::Absolute,
             MetricValue::Gauge { value: 123.45 },
         )
-        .with_timestamp(Some(Utc::now())),
+        .with_tags(Some(tags))
+        .with_timestamp(Some(ts)),
     );
 
-    // Test Histogram metric
+    let mut buf = Vec::new();
+    let result = encoder.encode_input(vec![gauge], &mut buf);
+    assert!(result.is_ok());
+
+    let request = ExportMetricsServiceRequest::decode(buf.as_slice()).unwrap();
+    assert_eq!(request.resource_metrics.len(), 1);
+
+    let rm = &request.resource_metrics[0];
+    // Resource has stripped attribute
+    let resource = rm.resource.as_ref().expect("resource present");
+    assert!(
+        resource
+            .attributes
+            .iter()
+            .any(|kv| kv.key == "service.name")
+    );
+
+    let metric = &rm.scope_metrics[0].metrics[0];
+    if let Some(Data::Gauge(g)) = &metric.data {
+        assert_eq!(g.data_points.len(), 1);
+        let dp = &g.data_points[0];
+
+        // Timestamps: time set, no start time
+        assert_eq!(dp.time_unix_nano, ts.timestamp_nanos_opt().unwrap() as u64);
+        assert_eq!(dp.start_time_unix_nano, 0);
+
+        // Attributes: normal tag present, resource tags not duplicated
+        let has = |k: &str| dp.attributes.iter().any(|kv| kv.key == k);
+        assert!(has("env"));
+        assert!(!has("resource.service.name"));
+        assert!(!has("service.name"));
+
+        // Value is encoded as double
+        match dp.value.as_ref() {
+            Some(NumberValue::AsDouble(v)) => assert_eq!(*v, 123.45),
+            other => panic!("expected AsDouble(123.45), got {:?}", other),
+        }
+    } else {
+        panic!("expected Gauge for g1");
+    }
+}
+
+#[test]
+fn test_histogram_bucket_counts_sum_equals_count() {
+    use crate::event::metric::Bucket;
+    use crate::event::{Metric, MetricKind, MetricValue};
+    use chrono::Utc;
+    use vector_lib::opentelemetry::proto::collector::metrics::v1::ExportMetricsServiceRequest;
+    use vector_lib::opentelemetry::proto::metrics::v1::metric::Data;
+
+    let encoder = OtlpEncoder::new_default();
+
+    // Aggregated histogram with explicit +Inf bucket
     let histogram = Event::Metric(
         Metric::new(
-            "test_histogram",
+            "h1",
             MetricKind::Absolute,
             MetricValue::AggregatedHistogram {
                 buckets: vec![
@@ -260,66 +347,34 @@ fn test_metrics_conversion() {
     );
 
     let mut buf = Vec::new();
-    let result = encoder.encode_input(vec![counter, gauge, histogram], &mut buf);
+    let result = encoder.encode_input(vec![histogram], &mut buf);
     assert!(result.is_ok());
 
     let request = ExportMetricsServiceRequest::decode(buf.as_slice()).unwrap();
+    assert_eq!(request.resource_metrics.len(), 1);
 
-    assert_eq!(request.resource_metrics.len(), 3);
+    let rm = &request.resource_metrics[0];
+    let metric = &rm.scope_metrics[0].metrics[0];
 
-    // Find each metric by name since order isn't guaranteed
-    let mut counter_metric = None;
-    let mut gauge_metric = None;
-    let mut histogram_metric = None;
-
-    for resource_metric in &request.resource_metrics {
-        assert_eq!(resource_metric.scope_metrics.len(), 1);
-        let scope_metrics = &resource_metric.scope_metrics[0];
-        assert_eq!(scope_metrics.metrics.len(), 1);
-        let metric = &scope_metrics.metrics[0];
-
-        match metric.name.as_str() {
-            "test_counter" => counter_metric = Some(metric),
-            "test_gauge" => gauge_metric = Some(metric),
-            "test_histogram" => histogram_metric = Some(metric),
-            _ => panic!("Unexpected metric name: {}", metric.name),
-        }
-    }
-
-    // Validate counter metric
-    let counter_metric = counter_metric.unwrap();
-    assert_eq!(counter_metric.name, "test_counter");
-    if let Some(Data::Sum(sum)) = &counter_metric.data {
-        assert_eq!(
-            sum.aggregation_temporality,
-            AggregationTemporality::Cumulative as i32
-        );
-        assert!(sum.is_monotonic);
-        assert_eq!(sum.data_points.len(), 1);
-    } else {
-        panic!("Expected counter to have Sum data");
-    }
-
-    // Validate gauge metric
-    let gauge_metric = gauge_metric.unwrap();
-    assert_eq!(gauge_metric.name, "test_gauge");
-    if let Some(Data::Gauge(_)) = &gauge_metric.data {
-        // Gauge validation passed
-    } else {
-        panic!("Expected gauge to have Gauge data");
-    }
-
-    // Validate histogram metric
-    let histogram_metric = histogram_metric.unwrap();
-    assert_eq!(histogram_metric.name, "test_histogram");
-    if let Some(Data::Histogram(hist)) = &histogram_metric.data {
+    if let Some(Data::Histogram(hist)) = &metric.data {
         assert_eq!(hist.data_points.len(), 1);
-        let data_point = &hist.data_points[0];
-        assert_eq!(data_point.count, 17);
-        assert_eq!(data_point.sum, Some(25.5));
-        assert_eq!(data_point.explicit_bounds, vec![1.0, 5.0]);
-        assert_eq!(data_point.bucket_counts, vec![5, 10, 2]);
+        let dp = &hist.data_points[0];
+
+        // Invariant: sum(bucket_counts) == count
+        let sum_bucket_counts: u64 = dp.bucket_counts.iter().copied().sum();
+        assert_eq!(sum_bucket_counts, dp.count);
+
+        // Invariant: bucket_counts.len() == explicit_bounds.len() + 1
+        assert_eq!(dp.bucket_counts.len(), dp.explicit_bounds.len() + 1);
+
+        // Bounds mapping: Vector upper limits excluding +inf become explicit_bounds
+        assert_eq!(dp.explicit_bounds, vec![1.0, 5.0]);
+
+        // Optional: sanity check the exact counts and total sum
+        assert_eq!(dp.bucket_counts, vec![5, 10, 2]);
+        assert_eq!(dp.count, 17);
+        assert_eq!(dp.sum, Some(25.5));
     } else {
-        panic!("Expected histogram to have Histogram data");
+        panic!("expected Histogram for h1");
     }
 }
