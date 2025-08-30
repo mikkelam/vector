@@ -369,13 +369,18 @@ fn convert_vector_metric_to_otlp(metric: VectorMetric) -> Option<OtlpMetric> {
             emit!(OtlpUnsupportedSetMetricDropped { name: name.clone() });
             return None;
         }
-        MetricValue::Distribution {
-            samples,
-            statistic: _,
-        } => convert_distribution_to_otlp(&attributes, time_unix_nano, samples, temporality),
+        MetricValue::Distribution { samples, statistic } => match statistic {
+            crate::event::metric::StatisticKind::Summary => {
+                let count = samples.len() as u64;
+                let sum = samples.iter().map(|s| s.value).sum::<f64>();
+                let quantiles = compute_quantiles_from_samples(samples, &[0.5, 0.9, 0.99]);
+                convert_summary_to_otlp(&attributes, time_unix_nano, &quantiles, count, sum)
+            }
+            _ => convert_distribution_to_otlp(&attributes, time_unix_nano, samples, temporality),
+        },
         MetricValue::Sketch { sketch } => {
-            // Sketch exported as cumulative histogram approximation
-            convert_sketch_to_otlp(&attributes, time_unix_nano, sketch)
+            // Sketch exported as ExponentialHistogram; temporality follows MetricKind
+            convert_sketch_to_otlp(&attributes, time_unix_nano, sketch, temporality)
         }
     };
 
@@ -534,125 +539,249 @@ fn convert_summary_to_otlp(
     }))
 }
 
+/// Computes quantiles from raw samples using nearest-rank method.
+/// Expects probabilities in [0.0, 1.0].
+fn compute_quantiles_from_samples(samples: &[Sample], probs: &[f64]) -> Vec<Quantile> {
+    if samples.is_empty() {
+        return probs
+            .iter()
+            .map(|&p| Quantile {
+                quantile: p,
+                value: 0.0,
+            })
+            .collect();
+    }
+    let mut vals: Vec<f64> = samples.iter().map(|s| s.value).collect();
+    vals.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let n = vals.len();
+    probs
+        .iter()
+        .map(|&p| {
+            let p = p.clamp(0.0, 1.0);
+            let idx = ((n - 1) as f64 * p).round() as usize;
+            Quantile {
+                quantile: p,
+                value: vals[idx],
+            }
+        })
+        .collect()
+}
+
 fn convert_distribution_to_otlp(
     attributes: &[KeyValue],
     time_unix_nano: u64,
     samples: &[Sample],
     aggregation_temporality: i32,
 ) -> Option<Data> {
-    // Convert distribution to histogram by creating buckets
-    // This is a basic conversion - in practice you might want more sophisticated bucketing
-    let mut bucket_counts = vec![0u64; 10]; // 10 buckets
-    let mut explicit_bounds = Vec::new();
-
-    // Create exponential buckets: 0.1, 1, 10, 100, 1000, etc.
-    for i in 0..9 {
-        explicit_bounds.push(10_f64.powi(i - 1));
-    }
-
-    let mut sum = 0.0;
+    // Convert distribution to ExponentialHistogram using a fixed scale.
+    // This provides wide dynamic range without predefining explicit bounds.
+    // TODO add user configuration for scale
     let count = samples.len() as u64;
+    let sum = samples.iter().map(|s| s.value).sum::<f64>();
+    let scale: i32 = 4;
+    let base = 2f64.powf(2f64.powi(-scale));
+    let mut zero_count: u64 = 0;
 
-    // Distribute samples into buckets
+    let mut pos_map: std::collections::BTreeMap<i32, u64> = std::collections::BTreeMap::new();
+    let mut neg_map: std::collections::BTreeMap<i32, u64> = std::collections::BTreeMap::new();
+
     for sample in samples {
-        sum += sample.value;
-
-        // Find which bucket this sample falls into
-        let mut bucket_index = explicit_bounds.len();
-        for (i, &bound) in explicit_bounds.iter().enumerate() {
-            if sample.value <= bound {
-                bucket_index = i;
-                break;
-            }
+        let v = sample.value;
+        if v == 0.0 {
+            zero_count += 1;
+            continue;
         }
-
-        // Increment only the matched bucket (non-cumulative per-bucket counts)
-        let last_index = bucket_counts.len().saturating_sub(1);
-        let idx = if bucket_index > last_index {
-            last_index
+        let abs = v.abs();
+        // floor(log_base(abs)) gives the exponential bucket index
+        let idx = (abs.ln() / base.ln()).floor() as i32;
+        if v > 0.0 {
+            *pos_map.entry(idx).or_insert(0) += 1;
         } else {
-            bucket_index
-        };
-        if let Some(slot) = bucket_counts.get_mut(idx) {
-            *slot += 1;
+            *neg_map.entry(idx).or_insert(0) += 1;
         }
     }
 
-    let data_point = HistogramDataPoint {
-        attributes: attributes.to_vec(),
-        time_unix_nano,
-        start_time_unix_nano: 0,
-        count,
-        sum: Some(sum),
-        bucket_counts,
-        explicit_bounds,
-        exemplars: Vec::new(),
-        flags: 0,
-        min: samples
-            .iter()
-            .map(|s| s.value)
-            .fold(f64::INFINITY, f64::min)
-            .into(),
-        max: samples
-            .iter()
-            .map(|s| s.value)
-            .fold(f64::NEG_INFINITY, f64::max)
-            .into(),
+    let positive = if !pos_map.is_empty() {
+        let min = *pos_map.keys().next().unwrap();
+        let max = *pos_map.keys().next_back().unwrap();
+        let mut bucket_counts = vec![0u64; (max - min + 1) as usize];
+        for (idx, c) in pos_map {
+            bucket_counts[(idx - min) as usize] = c;
+        }
+        Some(vector_lib::opentelemetry::proto::metrics::v1::exponential_histogram_data_point::Buckets {
+            offset: min,
+            bucket_counts,
+        })
+    } else {
+        None
     };
 
-    Some(Data::Histogram(Histogram {
-        data_points: vec![data_point],
-        aggregation_temporality,
-    }))
+    let negative = if !neg_map.is_empty() {
+        let min = *neg_map.keys().next().unwrap();
+        let max = *neg_map.keys().next_back().unwrap();
+        let mut bucket_counts = vec![0u64; (max - min + 1) as usize];
+        for (idx, c) in neg_map {
+            bucket_counts[(idx - min) as usize] = c;
+        }
+        Some(vector_lib::opentelemetry::proto::metrics::v1::exponential_histogram_data_point::Buckets {
+            offset: min,
+            bucket_counts,
+        })
+    } else {
+        None
+    };
+
+    let min = if count == 0 {
+        None
+    } else {
+        Some(
+            samples
+                .iter()
+                .map(|s| s.value)
+                .fold(f64::INFINITY, f64::min),
+        )
+    };
+    let max = if count == 0 {
+        None
+    } else {
+        Some(
+            samples
+                .iter()
+                .map(|s| s.value)
+                .fold(f64::NEG_INFINITY, f64::max),
+        )
+    };
+
+    let data_point = vector_lib::opentelemetry::proto::metrics::v1::ExponentialHistogramDataPoint {
+        attributes: attributes.to_vec(),
+        start_time_unix_nano: 0,
+        time_unix_nano,
+        count,
+        sum: Some(sum),
+        scale,
+        zero_count,
+        positive,
+        negative,
+        flags: 0,
+        exemplars: Vec::new(),
+        min,
+        max,
+        zero_threshold: 0.0,
+    };
+
+    Some(Data::ExponentialHistogram(
+        vector_lib::opentelemetry::proto::metrics::v1::ExponentialHistogram {
+            data_points: vec![data_point],
+            aggregation_temporality,
+        },
+    ))
 }
 
 fn convert_sketch_to_otlp(
     attributes: &[KeyValue],
     time_unix_nano: u64,
     sketch: &MetricSketch,
+    aggregation_temporality: i32,
 ) -> Option<Data> {
-    // Convert sketch to histogram using sketch's quantile information
-    // Use the sketch's internal bucket structure if available
     match sketch {
         MetricSketch::AgentDDSketch(ddsketch) => {
-            let mut bucket_counts = Vec::new();
-            let mut explicit_bounds = Vec::new();
+            use std::collections::BTreeMap;
 
-            // Create buckets based on sketch quantiles
-            let quantiles = [0.1, 0.25, 0.5, 0.75, 0.9, 0.95, 0.99];
-            let mut previous_value = 0.0;
+            // Match Distribution path: export as ExponentialHistogram with fixed scale.
+            // TODO: make scale configurable.
+            let scale: i32 = 4;
+            let base = 2f64.powf(2f64.powi(-scale));
+            let base_ln = base.ln();
 
-            for &q in &quantiles {
-                if let Some(value) = ddsketch.quantile(q) {
-                    explicit_bounds.push(value);
-                    // Estimate count in this bucket (this is approximate)
-                    let estimated_count = ((q - previous_value) * ddsketch.count() as f64) as u64;
-                    bucket_counts.push(estimated_count);
-                    previous_value = q;
+            let mut zero_count: u64 = 0;
+            let mut pos_map: BTreeMap<i32, u64> = BTreeMap::new();
+            let mut neg_map: BTreeMap<i32, u64> = BTreeMap::new();
+
+            {
+                let bin_map = ddsketch.bin_map();
+                let (keys, counts) = bin_map.into_parts();
+
+                for (&k, &n) in keys.iter().zip(counts.iter()) {
+                    let c = u64::from(n);
+
+                    if k == 0 {
+                        zero_count += c;
+                        continue;
+                    }
+
+                    let lb = ddsketch.config().bin_lower_bound(k);
+                    let abs = lb.abs();
+
+                    if abs.is_finite() && abs > 0.0 {
+                        let idx = (abs.ln() / base_ln).floor() as i32;
+                        if k > 0 {
+                            *pos_map.entry(idx).or_insert(0) += c;
+                        } else {
+                            *neg_map.entry(idx).or_insert(0) += c;
+                        }
+                    }
                 }
             }
 
-            // Add final bucket for remaining samples
-            bucket_counts.push(((1.0 - previous_value) * ddsketch.count() as f64) as u64);
-
-            let data_point = HistogramDataPoint {
-                attributes: attributes.to_vec(),
-                time_unix_nano,
-                start_time_unix_nano: 0, // Cumulative since unknown start time
-                count: ddsketch.count() as u64,
-                sum: ddsketch.sum(),
-                bucket_counts,
-                explicit_bounds,
-                exemplars: Vec::new(),
-                flags: 0,
-                min: ddsketch.min(),
-                max: ddsketch.max(),
+            let positive = if !pos_map.is_empty() {
+                let min = *pos_map.keys().next().unwrap();
+                let max = *pos_map.keys().next_back().unwrap();
+                let mut bucket_counts = vec![0u64; (max - min + 1) as usize];
+                for (idx, c) in pos_map {
+                    bucket_counts[(idx - min) as usize] = c;
+                }
+                Some(
+                    vector_lib::opentelemetry::proto::metrics::v1::exponential_histogram_data_point::Buckets {
+                        offset: min,
+                        bucket_counts,
+                    },
+                )
+            } else {
+                None
             };
 
-            Some(Data::Histogram(Histogram {
-                data_points: vec![data_point],
-                aggregation_temporality: AggregationTemporality::Cumulative as i32,
-            }))
+            let negative = if !neg_map.is_empty() {
+                let min = *neg_map.keys().next().unwrap();
+                let max = *neg_map.keys().next_back().unwrap();
+                let mut bucket_counts = vec![0u64; (max - min + 1) as usize];
+                for (idx, c) in neg_map {
+                    bucket_counts[(idx - min) as usize] = c;
+                }
+                Some(
+                    vector_lib::opentelemetry::proto::metrics::v1::exponential_histogram_data_point::Buckets {
+                        offset: min,
+                        bucket_counts,
+                    },
+                )
+            } else {
+                None
+            };
+
+            let data_point =
+                vector_lib::opentelemetry::proto::metrics::v1::ExponentialHistogramDataPoint {
+                    attributes: attributes.to_vec(),
+                    start_time_unix_nano: 0,
+                    time_unix_nano,
+                    count: ddsketch.count() as u64,
+                    sum: ddsketch.sum(),
+                    scale,
+                    zero_count,
+                    positive,
+                    negative,
+                    flags: 0,
+                    exemplars: Vec::new(),
+                    min: ddsketch.min(),
+                    max: ddsketch.max(),
+                    // Treat DDSketch k=0 bin as zero bucket using DDSketch min positive bound.
+                    zero_threshold: ddsketch.config().bin_lower_bound(1),
+                };
+
+            Some(Data::ExponentialHistogram(
+                vector_lib::opentelemetry::proto::metrics::v1::ExponentialHistogram {
+                    data_points: vec![data_point],
+                    aggregation_temporality,
+                },
+            ))
         }
     }
 }

@@ -378,3 +378,182 @@ fn test_histogram_bucket_counts_sum_equals_count() {
         panic!("expected Histogram for h1");
     }
 }
+
+#[test]
+fn test_distribution_exponential_histogram_conversion() {
+    use crate::event::metric::{Sample, StatisticKind};
+    use crate::event::{Metric, MetricKind, MetricValue};
+    use chrono::Utc;
+    use vector_lib::opentelemetry::proto::collector::metrics::v1::ExportMetricsServiceRequest;
+    use vector_lib::opentelemetry::proto::metrics::v1::{AggregationTemporality, metric::Data};
+
+    let encoder = OtlpEncoder::new_default();
+
+    let ts = Utc::now();
+
+    // Distribution with negative, zero, and positive values
+    let samples = vec![
+        Sample {
+            value: -1.0,
+            rate: 1,
+        },
+        Sample {
+            value: 0.0,
+            rate: 1,
+        },
+        Sample {
+            value: 1.0,
+            rate: 1,
+        },
+        Sample {
+            value: 10.0,
+            rate: 1,
+        },
+    ];
+
+    let distribution = Event::Metric(
+        Metric::new(
+            "d1",
+            MetricKind::Absolute,
+            MetricValue::Distribution {
+                samples,
+                statistic: StatisticKind::Histogram,
+            },
+        )
+        .with_timestamp(Some(ts)),
+    );
+
+    let mut buf = Vec::new();
+    let result = encoder.encode_input(vec![distribution], &mut buf);
+    assert!(result.is_ok());
+
+    let request = ExportMetricsServiceRequest::decode(buf.as_slice()).unwrap();
+    assert_eq!(request.resource_metrics.len(), 1);
+
+    let rm = &request.resource_metrics[0];
+    let metric = &rm.scope_metrics[0].metrics[0];
+
+    if let Some(Data::ExponentialHistogram(eh)) = &metric.data {
+        assert_eq!(
+            eh.aggregation_temporality,
+            AggregationTemporality::Cumulative as i32
+        );
+        assert_eq!(eh.data_points.len(), 1);
+
+        let dp = &eh.data_points[0];
+
+        // Timestamps: time set, no start time
+        assert_eq!(dp.time_unix_nano, ts.timestamp_nanos_opt().unwrap() as u64);
+        assert_eq!(dp.start_time_unix_nano, 0);
+
+        // Basic invariants and properties
+        assert_eq!(dp.count, 4);
+        assert_eq!(dp.sum, Some(10.0));
+        assert_eq!(dp.zero_count, 1);
+        assert_eq!(dp.scale, 4);
+
+        // Positive/negative buckets present for this sample set
+        assert!(dp.positive.is_some());
+        assert!(dp.negative.is_some());
+
+        // Sum(positive) + Sum(negative) + zero_count == count
+        let pos_sum: u64 = dp
+            .positive
+            .as_ref()
+            .map(|b| b.bucket_counts.iter().copied().sum())
+            .unwrap_or(0);
+        let neg_sum: u64 = dp
+            .negative
+            .as_ref()
+            .map(|b| b.bucket_counts.iter().copied().sum())
+            .unwrap_or(0);
+        assert_eq!(pos_sum + neg_sum + dp.zero_count, dp.count);
+
+        // Min/max derived from samples
+        assert_eq!(dp.min, Some(-1.0));
+        assert_eq!(dp.max, Some(10.0));
+    } else {
+        panic!("expected ExponentialHistogram for d1");
+    }
+}
+
+#[test]
+fn test_sketch_exponential_histogram_conversion() {
+    use crate::event::{Metric, MetricKind, MetricValue, metric::MetricSketch};
+    use chrono::Utc;
+    use vector_lib::metrics::AgentDDSketch;
+    use vector_lib::opentelemetry::proto::collector::metrics::v1::ExportMetricsServiceRequest;
+    use vector_lib::opentelemetry::proto::metrics::v1::{AggregationTemporality, metric::Data};
+
+    let encoder = OtlpEncoder::new_default();
+
+    let ts = Utc::now();
+
+    // Build a sketch with negative, zero, and positive values
+    let mut ddsketch = AgentDDSketch::with_agent_defaults();
+    ddsketch.insert(-1.0);
+    ddsketch.insert(0.0);
+    ddsketch.insert(1.0);
+    ddsketch.insert(10.0);
+
+    // Capture expected zero threshold before moving the sketch
+    let expected_zero_threshold = ddsketch.config().bin_lower_bound(1);
+
+    let metric = Event::Metric(
+        Metric::new("s1", MetricKind::Absolute, ddsketch.into()).with_timestamp(Some(ts)),
+    );
+
+    let mut buf = Vec::new();
+    let result = encoder.encode_input(vec![metric], &mut buf);
+    assert!(result.is_ok());
+
+    let request = ExportMetricsServiceRequest::decode(buf.as_slice()).unwrap();
+    assert_eq!(request.resource_metrics.len(), 1);
+
+    let rm = &request.resource_metrics[0];
+    let metric = &rm.scope_metrics[0].metrics[0];
+
+    if let Some(Data::ExponentialHistogram(eh)) = &metric.data {
+        assert_eq!(
+            eh.aggregation_temporality,
+            AggregationTemporality::Cumulative as i32
+        );
+        assert_eq!(eh.data_points.len(), 1);
+
+        let dp = &eh.data_points[0];
+
+        // Timestamps: time set, no start time
+        assert_eq!(dp.time_unix_nano, ts.timestamp_nanos_opt().unwrap() as u64);
+        assert_eq!(dp.start_time_unix_nano, 0);
+
+        // Basic invariants and properties
+        assert_eq!(dp.count, 4);
+        assert_eq!(dp.sum, Some(10.0));
+        assert_eq!(dp.zero_count, 1);
+        assert_eq!(dp.scale, 4);
+        assert_eq!(dp.zero_threshold, expected_zero_threshold);
+
+        // Positive/negative buckets present for this sample set
+        assert!(dp.positive.is_some());
+        assert!(dp.negative.is_some());
+
+        // Sum(positive) + Sum(negative) + zero_count == count
+        let pos_sum: u64 = dp
+            .positive
+            .as_ref()
+            .map(|b| b.bucket_counts.iter().copied().sum())
+            .unwrap_or(0);
+        let neg_sum: u64 = dp
+            .negative
+            .as_ref()
+            .map(|b| b.bucket_counts.iter().copied().sum())
+            .unwrap_or(0);
+        assert_eq!(pos_sum + neg_sum + dp.zero_count, dp.count);
+
+        // Min/max derived from samples
+        assert_eq!(dp.min, Some(-1.0));
+        assert_eq!(dp.max, Some(10.0));
+    } else {
+        panic!("expected ExponentialHistogram for s1");
+    }
+}
